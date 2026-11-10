@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- BO3 Recomp for Android: physical gamepad only, on-screen OPCIONES button. Each game runs in
+     its own process (both libraries contain SDL and the runtime). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.bo3recomp"
+    android:versionCode="1"
+    android:versionName="0.1">
+
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- local sockets only: the game creates them even offline (the runtime keeps networking offline) -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- first-run installation from the player's disc image in /sdcard/BO3Recomp (runtime/src/setup.cpp) -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+
+    <application android:label="BO3 Recomp" android:debuggable="true"
+        android:icon="@mipmap/ic_zm"
+        android:allowBackup="false"
+        android:theme="@style/AppTheme"
+        android:extractNativeLibs="true"
+        android:hardwareAccelerated="true">
+
+        <meta-data android:name="SDL_ENV.SDL_ANDROID_TRAP_BACK_BUTTON" android:value="0"/>
+
+        <activity android:name="com.bo3recomp.ZombiesActivity"
+            android:label="BO3 Zombies"
+            android:icon="@mipmap/ic_zm"
+            android:process=":zm"
+            android:taskAffinity="com.bo3recomp.zm"
+            android:launchMode="singleInstance"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="layoutDirection|locale|fontScale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:preferMinimalPostProcessing="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity android:name="com.bo3recomp.MultiplayerActivity"
+            android:label="BO3 Multijugador"
+            android:icon="@mipmap/ic_mp"
+            android:process=":mp"
+            android:taskAffinity="com.bo3recomp.mp"
+            android:launchMode="singleInstance"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="layoutDirection|locale|fontScale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:preferMinimalPostProcessing="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

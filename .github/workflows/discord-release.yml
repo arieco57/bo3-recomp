@@ -1,0 +1,58 @@
+# Posts every published GitHub release to Discord (webhooks, no bot to host):
+#   #announcements     the release notes + link        secret DISCORD_WEBHOOK_ANNOUNCEMENTS
+#   #download-linux    direct links to the Linux files  secret DISCORD_WEBHOOK_LINUX
+#   #download-android  direct links to the APK          secret DISCORD_WEBHOOK_ANDROID
+# Webhook URL: Discord channel > Edit channel > Integrations > Webhooks > New webhook > Copy URL.
+# GitHub: repository Settings > Secrets and variables > Actions > New repository secret.
+name: Discord release announcement
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to announce again"
+        required: true
+permissions:
+  contents: read
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to Discord
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          HOOK_ANN: ${{ secrets.DISCORD_WEBHOOK_ANNOUNCEMENTS }}
+          HOOK_LINUX: ${{ secrets.DISCORD_WEBHOOK_LINUX }}
+          HOOK_ANDROID: ${{ secrets.DISCORD_WEBHOOK_ANDROID }}
+        run: |
+          set -e
+          # the assets may still be uploading when the release is published
+          for i in $(seq 1 20); do
+            gh api "repos/$REPO/releases/tags/$TAG" > rel.json
+            [ "$(jq '.assets | length' rel.json)" -ge 2 ] && break
+            sleep 15
+          done
+          NAME=$(jq -r '.name // .tag_name' rel.json)
+          URL=$(jq -r '.html_url' rel.json)
+          post() {   # webhook, json body
+            [ -n "$1" ] || { echo "webhook not configured, skipped"; return 0; }
+            curl -sS -f -H "Content-Type: application/json" -d "$2" "$1" > /dev/null
+          }
+          links() {   # regex of asset names -> markdown list
+            jq -r --arg re "$1" '[.assets[] | select(.name | test($re; "i")) | "- [\(.name)](\(.browser_download_url)) (\((.size / 1048576 * 10 | floor) / 10) MB)"] | join("\n")' rel.json
+          }
+          BODY=$(jq -r '.body // ""' rel.json | head -c 3500)
+          post "$HOOK_ANN" "$(jq -n --arg t "$NAME" --arg u "$URL" --arg d "$BODY" \
+            '{content: "@everyone Nueva versión: **\($t)**", allowed_mentions: {parse: ["everyone"]},
+              embeds: [{title: $t, url: $u, description: $d, color: 16744448}]}')"
+          L=$(links 'linux'); A=$(links 'android|\.apk$')
+          [ -n "$L" ] && post "$HOOK_LINUX" "$(jq -n --arg t "$NAME" --arg u "$URL" --arg l "$L" \
+            '{embeds: [{title: "\($t) - Linux", url: $u, color: 16744448,
+              description: "\($l)\n\nDescomprimí el .tar.gz y seguí LEEME.txt (necesitás tu copia del juego)."}]}')"
+          [ -n "$A" ] && post "$HOOK_ANDROID" "$(jq -n --arg t "$NAME" --arg u "$URL" --arg l "$A" \
+            '{embeds: [{title: "\($t) - Android", url: $u, color: 3066993,
+              description: "\($l)\n\nInstalá el APK y copiá tu .iso + Title Update a la carpeta BO3Recomp del teléfono."}]}')"
+          echo "announced $NAME"

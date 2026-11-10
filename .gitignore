@@ -1,0 +1,44 @@
+# Copyrighted game data - never commit or redistribute
+*.zar
+content/
+extracted/
+private/
+# Generated from the game executable (also derived from copyrighted code)
+ppc/
+config/*_switch_tables.toml
+config/*_functions.toml
+config/BO3_MP.toml
+config/BO3_ZM.toml
+
+# Build outputs
+build/
+tools/XenonRecomp/
+tools/bo3prep/bo3prep
+tools/bo3prep/bo3switch
+tools/bo3prep/ppcdis
+
+# Third-party sources fetched for reference/building
+tools/xenia-ref/
+tools/XenosRecomp/
+thirdparty/
+bo3recomp.ini
+shadercache/
+bo3_profile.txt
+
+# Android builds
+build-android/
+thirdparty/ffmpeg-android/
+thirdparty/ffmpeg-android-build/
+
+# Local state / secrets / user files
+account.txt
+launchdata.bin
+.attach_pid*
+*.iso
+*.part
+online/
+press.txt
+shot.txt
+# Release packages (tools/make_release.sh)
+dist/
+release.conf

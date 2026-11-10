@@ -1,0 +1,27 @@
+BO3 Recomp para Android
+=======================
+
+Una sola app con dos íconos: "BO3 Multijugador" y "BO3 Zombies" (comparten los datos
+del juego, así se instala una sola vez).
+
+REQUISITOS
+- Android 10 o más nuevo, 64 bits, con Vulkan.
+- Probado en GPU Adreno (Qualcomm Snapdragon). Con Mali / PowerVR puede no funcionar.
+- Unos 16 GB libres para instalar (8 GB del juego + la imagen que copies; la imagen se
+  puede borrar después).
+
+INSTALACIÓN
+1. Instalá el APK (permití "instalar apps desconocidas").
+2. Copiá a la carpeta BO3Recomp de la memoria del teléfono (o a Descargas):
+   - la imagen del disco (.iso) de tu copia de Xbox 360,
+   - el Title Update del juego (archivo de Content/0000000000000000/4156091D/000B0000/),
+   - los Compatibility Pack 1 y 2 (DLC gratis, obligatorios) y tus otros DLC
+     (archivos de Content/0000000000000000/4156091D/00000002/).
+3. Abrí la app. Te pide el permiso "Acceso a todos los archivos" (para leer esa
+   carpeta), y la primera vez instala el juego sola: puede tardar 15-20 minutos con la
+   pantalla quieta, no la cierres.
+
+JUGAR
+- Mando por Bluetooth/USB, o el mando en pantalla: OPCIONES > "Mando virtual".
+- OPCIONES (arriba a la derecha) = resolución interna, FPS, mando virtual.
+- Online con cuenta: el progreso se comparte con la versión de PC.

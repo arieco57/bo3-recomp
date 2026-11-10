@@ -1,0 +1,8 @@
+Poné acá los archivos de tu copia original (Xbox 360):
+- la imagen del disco (.iso)
+- el Title Update (archivo de Content/0000000000000000/4156091D/000B0000/ de la consola)
+- los Compatibility Pack 1 y 2 (obligatorios, gratis) y tus otros DLC
+  (archivos de Content/0000000000000000/4156091D/00000002/)
+Después abrí el juego: se instala solo.
+
+Put your disc image (.iso), the Title Update, Compatibility Packs 1 + 2 and other DLC here.
