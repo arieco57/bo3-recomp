@@ -27,6 +27,8 @@
 #include <string>
 #include <vector>
 
+int RendezvousOnlineCount();   // rendezvous.cpp: accounts seen online lately, -1 = unknown
+
 namespace
 {
 const char* kConfigPath = "bo3recomp.ini";
@@ -377,16 +379,19 @@ void VideoOptionsDialog(SDL_Window* w)
     HostInputReleaseMouse();
     for (;;)
     {
+        // online players (refreshed every 10 s by the rendezvous): shown on every page of the menu
+        const int online = RendezvousOnlineCount();
+        const std::string onlineLine = online >= 0 ? "Jugadores online: " + std::to_string(online)
+                                                   : std::string("Jugadores online: (solo con cuenta online)");
         std::string text = "Resolución interna: " + ScaleName(s_cfg.renderScale) + "\nVentana / pantalla: " + ResName(w) +
                            "\nPantalla completa: " + (s_cfg.fullscreen ? "ON" : "OFF") +
                            "\nContador de FPS: " + kOverlayNames[s_cfg.fpsOverlay] +
-                           "\nLímite de FPS: " + std::to_string(s_cfg.fpsLimit) +
-
+                           "\nLímite de FPS: " + std::to_string(s_cfg.fpsLimit) + "\n" + onlineLine +
                            "\n\nLos cambios se guardan en bo3recomp.ini.\nAtajos: F1 opciones, F2 contador de FPS, F11 o Alt+Enter pantalla completa.";
 #ifdef __ANDROID__
         // always full screen, gamepad only: just the options that apply on a phone
         text = "Resolución interna: " + ScaleName(s_cfg.renderScale) + "\nContador de FPS: " + kOverlayNames[s_cfg.fpsOverlay] +
-               "\nLímite de FPS: " + std::to_string(s_cfg.fpsLimit) + "\n\nLos cambios se guardan en bo3recomp.ini.";
+               "\nLímite de FPS: " + std::to_string(s_cfg.fpsLimit) + "\n" + onlineLine + "\n\nLos cambios se guardan en bo3recomp.ini.";
         int a = Ask(w, "Opciones - BO3 Recomp", text,
                     { "Resolución interna...", std::string("Contador de FPS: ") + kOverlayNames[s_cfg.fpsOverlay], "Límite de FPS...",
                       std::string("Mando virtual: ") + (s_cfg.virtualPad ? "ON" : "OFF"), "Cerrar" });

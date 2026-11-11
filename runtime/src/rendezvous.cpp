@@ -13,6 +13,7 @@
 #include "log.h"
 
 #include <arpa/inet.h>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +38,9 @@ void NetSetRendezvousPeers(const std::vector<std::pair<uint32_t, uint16_t>>& eps
 
 namespace
 {
+// players (distinct accounts) seen in the last 90 s, -1 = unknown (not signed in / no reply)
+std::atomic<int> s_onlineCount{ -1 };
+
 std::string IpText(uint32_t ip)
 {
     char b[20];
@@ -132,15 +136,16 @@ void Worker(std::string url, std::string key)
         }
         if (r.status < 200 || r.status >= 300) LogWarn("rendezvous: publish failed (%d) %s", r.status, r.body.substr(0, 200).c_str());
         // the others seen lately
-        r = HttpRequest("GET", url + "/rest/v1/online_peers?select=vip,gamertag,public_ip,public_port,local_ip,local_port&updated_at=gt." +
+        r = HttpRequest("GET", url + "/rest/v1/online_peers?select=owner,vip,gamertag,public_ip,public_port,local_ip,local_port&updated_at=gt." +
                                    IsoTime(time(nullptr) - 90), h, "");
         if (r.status == 200)
         {
             std::vector<std::pair<uint32_t, uint16_t>> eps;
-            std::set<std::string> seen;
+            std::set<std::string> seen, accounts;
             for (auto& obj : JsonObjects(r.body))
             {
                 uint32_t vip = uint32_t(strtoul(JsonField(obj, "vip").c_str(), nullptr, 10));
+                if (std::string owner = JsonField(obj, "owner"); !owner.empty()) accounts.insert(owner);
                 if (!vip || vip == NetVirtualIp()) continue;
                 uint32_t pip = IpParse(JsonField(obj, "public_ip")), lip = IpParse(JsonField(obj, "local_ip"));
                 uint16_t pp = uint16_t(atoi(JsonField(obj, "public_port").c_str())), lp = uint16_t(atoi(JsonField(obj, "local_port").c_str()));
@@ -154,12 +159,15 @@ void Worker(std::string url, std::string key)
                 if (!known.count(id)) Log("rendezvous: online player \"%s\" at %s:%u (LAN %s:%u)", JsonField(obj, "gamertag").c_str(), IpText(pip).c_str(), pp, IpText(lip).c_str(), lp);
             }
             known = seen;
+            s_onlineCount = int(accounts.size());
             NetSetRendezvousPeers(eps);
         }
         std::this_thread::sleep_for(std::chrono::seconds(10));
     }
 }
 }
+
+int RendezvousOnlineCount() { return s_onlineCount.load(); }
 
 void RendezvousStart()
 {
