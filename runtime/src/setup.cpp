@@ -11,6 +11,7 @@
 // and, on Android, /sdcard/BO3Recomp (all files access, asked for when needed). A folder copied
 // from Xenia's content layout or an already extracted disc also works: what exists is kept.
 #include "setup.h"
+#include "zar.h"
 #include "log.h"
 #include "ui.h"
 
@@ -349,6 +350,24 @@ std::vector<std::string> InputDirs()
     return d;
 }
 
+// Puts one file in the list of its kind (disc image, Title Update, DLC); other files are ignored.
+void Classify(Inputs& in, const std::string& p)
+{
+    std::error_code ec;
+    if (!fs::is_regular_file(p, ec) || fs::file_size(p, ec) < 0x1000) return;
+    FILE* f = fopen(p.c_str(), "rb");
+    if (!f) return;
+    uint64_t base;
+    bool big = fs::file_size(p, ec) > (64ull << 20);
+    bool disc = big && (DiscPartition(f, base) || ZarIsArchive(p));
+    fclose(f);
+    if (disc) { in.discs.push_back(p); return; }
+    Stfs s;
+    if (!s.Open(p) || s.titleId != kTitleId) return;
+    if (s.contentType == 0xB0000) in.updates.push_back(p);
+    else if (s.contentType == 2) in.dlcs.push_back(p);
+}
+
 Inputs FindInputs()
 {
     Inputs in;
@@ -356,20 +375,7 @@ Inputs FindInputs()
     {
         std::error_code ec;
         for (auto& e : fs::directory_iterator(dir, ec))
-        {
-            if (!e.is_regular_file(ec) || e.file_size(ec) < 0x1000) continue;
-            std::string p = e.path().string();
-            FILE* f = fopen(p.c_str(), "rb");
-            if (!f) continue;
-            uint64_t base;
-            bool disc = e.file_size(ec) > (64ull << 20) && DiscPartition(f, base);
-            fclose(f);
-            if (disc) { in.discs.push_back(p); continue; }
-            Stfs s;
-            if (!s.Open(p) || s.titleId != kTitleId) continue;
-            if (s.contentType == 0xB0000) in.updates.push_back(p);
-            else if (s.contentType == 2) in.dlcs.push_back(p);
-        }
+            if (e.is_regular_file(ec)) Classify(in, e.path().string());
     }
     return in;
 }
@@ -391,6 +397,21 @@ const char* kHowTo =
 #endif
     " y volvé a abrir el juego. La instalación es automática.";
 
+// packages in the list whose display name contains `needle`
+int CountDlcNamed(const Inputs& in, const std::string& needle)
+{
+    int n = 0;
+    for (auto& p : in.dlcs)
+    {
+        Stfs s;
+        if (!s.Open(p)) continue;
+        std::string name;
+        for (char16_t c : s.displayName) if (c < 128) name += char(c);
+        if (name.find(needle) != std::string::npos) n++;
+    }
+    return n;
+}
+
 // BO3_SETUP_YES=1: no dialogs (automated tests); the messages still go to the log
 void Tell(const std::string& text)
 {
@@ -410,6 +431,103 @@ bool Fail(const std::string& what)
 bool AndroidStorageAccess(bool ask);   // below (JNI)
 #endif
 }
+
+#ifndef __ANDROID__
+// ------------------------------------------------------------------------------ step by step
+// When the game's files are not where the installer looks, the first run of the AppImage (or of
+// the binary) asks for them one by one with the desktop's file dialogs (zenity, or kdialog).
+bool HaveTool(const char* name) { return system((std::string("command -v ") + name + " >/dev/null 2>&1").c_str()) == 0; }
+const char* DialogTool()
+{
+    static const char* tool = HaveTool("zenity") ? "zenity" : HaveTool("kdialog") ? "kdialog" : nullptr;
+    return tool;
+}
+bool IsZenity() { return std::string(DialogTool() ? DialogTool() : "") == "zenity"; }
+
+// stdout of a shell command and its exit status
+std::string Shell(const std::string& cmd, int& status)
+{
+    std::string out;
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) { status = -1; return out; }
+    char b[4096];
+    size_t n;
+    while ((n = fread(b, 1, sizeof(b), p)) > 0) out.append(b, n);
+    status = pclose(p);
+    return out;
+}
+
+// file dialog: the chosen paths (false = cancelled). patterns like "*.zar *.iso".
+bool WizardPick(const std::string& title, const std::string& filterName, const std::string& patterns, bool multiple, std::vector<std::string>& out)
+{
+    int st = 0;
+    std::string cmd;
+    if (IsZenity())
+        cmd = "zenity --file-selection --title='" + title + "' --file-filter='" + filterName + " | " + patterns + "'" +
+              (multiple ? " --multiple --separator='|'" : "");
+    else
+        cmd = std::string("kdialog --title '") + title + "' --getopenfilename \"$HOME\" '" + patterns + "'" +
+              (multiple ? " --multiple --separate-output" : "");
+    std::string res = Shell(cmd, st);
+    if (st != 0) return false;
+    while (!res.empty() && (res.back() == '\n' || res.back() == '\r')) res.pop_back();
+    if (res.empty()) return false;
+    for (char& c : res) if (c == '\n') c = '|';
+    size_t pos = 0;
+    while (pos <= res.size())
+    {
+        size_t e = res.find('|', pos);
+        if (e == std::string::npos) e = res.size();
+        if (e > pos) out.push_back(res.substr(pos, e - pos));
+        pos = e + 1;
+    }
+    return !out.empty();
+}
+
+// question with two buttons (true = the first one)
+bool WizardAsk(const std::string& text, const std::string& yes, const std::string& no)
+{
+    int st = 0;
+    if (IsZenity())
+        Shell("zenity --question --title='BO3 Recomp - instalación' --text='" + text + "' --ok-label='" + yes + "' --cancel-label='" + no + "'", st);
+    else
+        Shell("kdialog --title 'BO3 Recomp - instalación' --yesno '" + text + "'", st);
+    return st == 0;
+}
+
+// Asks for what is missing, one step at a time. False = the player cancelled.
+bool RunWizard(Inputs& in)
+{
+    if (!DialogTool()) return false;
+    std::vector<std::string> picked;
+    if (!WizardAsk("BO3 Recomp - instalación del juego\n\nVas a instalar Call of Duty: Black Ops III (Xbox 360) desde tu copia. "
+                   "Te voy a pedir, paso a paso:\n\n1. La imagen del disco (.zar o .iso)\n2. El Title Update del juego\n"
+                   "3. Los Compatibility Pack 1 y 2 (gratis, obligatorios) y los DLC que tengas\n\nEl proceso tarda unos minutos.",
+                   "Empezar", "Cancelar"))
+        return false;
+    if (!GameOk() && in.discs.empty())
+    {
+        if (!WizardPick("Paso 1 de 3: la imagen del disco", "Disco de Xbox 360", "*.zar *.iso", false, picked)) return false;
+        for (auto& p : picked) Classify(in, p);
+        picked.clear();
+    }
+    if (!TuOk() && in.updates.empty())
+    {
+        if (!WizardPick("Paso 2 de 3: el Title Update (archivo de Content/0000000000000000/4156091D/000B0000/)", "Title Update", "*", false, picked))
+            return false;
+        for (auto& p : picked) Classify(in, p);
+        picked.clear();
+    }
+    if (CountDlcNamed(in, "Compatibility Pack") < 2)
+    {
+        if (WizardAsk("Paso 3 de 3: elegí los Compatibility Pack 1 y 2 y, si querés, los demás DLC (archivos de Content/0000000000000000/4156091D/00000002/).",
+                      "Elegir", "Omitir") &&
+            WizardPick("Paso 3 de 3: DLC (Compatibility Pack 1 y 2 y los demás)", "DLC (STFS)", "*", true, picked))
+            for (auto& p : picked) Classify(in, p);
+    }
+    return true;
+}
+#endif
 
 bool SetupGameData()
 {
@@ -435,6 +553,19 @@ bool SetupGameData()
 #endif
     Inputs in = FindInputs();
     Log("setup: %zu disc image(s), %zu title update(s), %zu DLC package(s) found", in.discs.size(), in.updates.size(), in.dlcs.size());
+#ifndef __ANDROID__
+    static const bool quiet = getenv("BO3_SETUP_YES") && *getenv("BO3_SETUP_YES") == '1';
+    bool cpInstalled = Exists(std::string(kDlcDir) + "/A92CACF8DF6D9DB1C32970035A6B8B63B09C2F1641") &&
+                       Exists(std::string(kDlcDir) + "/4FD64D1A99FF002F54CEE0FE922808E1D2D21A5341");
+    bool needWizard = (!GameOk() && in.discs.empty()) || (!TuOk() && in.updates.empty()) ||
+                      (!cpInstalled && CountDlcNamed(in, "Compatibility Pack") < 2);
+    if (needWizard && !quiet)
+    {
+        Log("setup: asking for the missing files");
+        RunWizard(in);
+        Log("setup: %zu disc image(s), %zu title update(s), %zu DLC package(s) after the wizard", in.discs.size(), in.updates.size(), in.dlcs.size());
+    }
+#endif
     if (!GameOk() && in.discs.empty()) return Fail(std::string("No se encontró la imagen del disco (.iso).\n\n") + kHowTo);
     if (!TuOk() && in.updates.empty()) return Fail(std::string("No se encontró el Title Update del juego.\n\n") + kHowTo);
 
@@ -448,7 +579,24 @@ bool SetupGameData()
 
     // 1. the disc
     bool discNow = false;
-    if (!GameOk())
+    if (!GameOk() && ZarIsArchive(in.discs[0]))
+    {
+        discNow = true;
+        std::string tmp = std::string(kGameDir) + ".part", err;
+        std::error_code ec;
+        fs::remove_all(tmp, ec);
+        Log("setup: extracting the .zar disc image %s", in.discs[0].c_str());
+        int lastPct = -1;
+        bool ok = ZarExtract(in.discs[0], tmp, err, [&](uint64_t done, uint64_t total) {
+            int pct = total ? int(done * 100 / total) : 100;
+            if (pct / 10 != lastPct / 10) { lastPct = pct; Log("setup: disc %d%%", pct); }
+        });
+        if (!ok) { fs::remove_all(tmp, ec); return Fail("No se pudo leer la imagen del disco (.zar): " + err); }
+        fs::remove_all(kGameDir, ec);
+        fs::rename(tmp, kGameDir, ec);
+        if (ec) return Fail("No se pudo terminar la extracción del disco: " + ec.message());
+    }
+    else if (!GameOk())
     {
         discNow = true;
         FILE* f = fopen(in.discs[0].c_str(), "rb");

@@ -44,6 +44,5 @@ for g in mp zm; do
     ARCH=x86_64 "$AIT" --appimage-extract-and-run "$D" "$OUT/BO3Recomp-$g-$VER-x86_64.AppImage" > /dev/null
 done
 cp build-android/bo3recomp.apk "$OUT/BO3Recomp-$VER-Android.apk"
-rm -rf "$L"
 ( cd "$OUT" && sha256sum BO3Recomp-* > SHA256SUMS.txt )
 ls -la "$OUT"
