@@ -500,7 +500,7 @@ bool RunWizard(Inputs& in)
 {
     if (!DialogTool()) return false;
     std::vector<std::string> picked;
-    if (!WizardAsk("BO3 Recomp - instalación del juego\n\nVas a instalar Call of Duty: Black Ops III (Xbox 360) desde tu copia. "
+    if (!WizardAsk("Vas a instalar Call of Duty: Black Ops III (Xbox 360) desde tu copia. "
                    "Te voy a pedir, paso a paso:\n\n1. La imagen del disco (.zar o .iso)\n2. El Title Update del juego\n"
                    "3. Los Compatibility Pack 1 y 2 (gratis, obligatorios) y los DLC que tengas\n\nEl proceso tarda unos minutos.",
                    "Empezar", "Cancelar"))
@@ -566,7 +566,7 @@ bool SetupGameData()
         Log("setup: %zu disc image(s), %zu title update(s), %zu DLC package(s) after the wizard", in.discs.size(), in.updates.size(), in.dlcs.size());
     }
 #endif
-    if (!GameOk() && in.discs.empty()) return Fail(std::string("No se encontró la imagen del disco (.iso).\n\n") + kHowTo);
+    if (!GameOk() && in.discs.empty()) return Fail(std::string("No se encontró la imagen del disco (.zar o .iso).\n\n") + kHowTo);
     if (!TuOk() && in.updates.empty()) return Fail(std::string("No se encontró el Title Update del juego.\n\n") + kHowTo);
 
     std::string what;
