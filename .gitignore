@@ -42,3 +42,4 @@ shot.txt
 # Release packages (tools/make_release.sh)
 dist/
 release.conf
+tools/cache/

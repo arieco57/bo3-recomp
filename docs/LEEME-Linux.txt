@@ -12,27 +12,33 @@ REQUISITOS
 - Unos 8 GB libres para la instalación.
 
 INSTALACIÓN (una sola vez)
-1. Descomprimí esta carpeta donde quieras.
-2. Copiá a la carpeta "instalar" (o a esta misma carpeta):
+1. Poné en una misma carpeta (por ejemplo ~/Juegos/BO3Recomp):
+   - BO3Recomp-mp-<versión>-x86_64.AppImage (Multijugador)
+   - BO3Recomp-zm-<versión>-x86_64.AppImage (Zombies)
+   - una carpeta llamada "instalar"
+2. Copiá a la carpeta "instalar":
    - La imagen del disco del juego (.iso, dump de tu disco).
    - El Title Update del juego: el archivo de tu consola en
      Content/0000000000000000/4156091D/000B0000/
      (es obligatorio: el port corresponde al juego actualizado).
    - Los Compatibility Pack 1 y 2 (DLC gratis de Xbox Live, obligatorios) y, si querés,
      el resto de tus DLC: archivos de Content/0000000000000000/4156091D/00000002/
-3. Abrí jugar-multijugador.sh o jugar-zombies.sh. La primera vez el juego se instala
-   solo desde esos archivos (tarda unos minutos) y verifica que sea la versión correcta.
-   Después podés borrar el .iso y los paquetes.
+3. Dale permiso de ejecución al AppImage (clic derecho > Propiedades > Permisos, o en la
+   terminal: chmod +x BO3Recomp-*.AppImage) y ábrelo con doble clic. La primera vez el
+   juego se instala solo desde esos archivos (tarda unos minutos) y verifica que sea la
+   versión correcta. Después podés borrar el .iso y los paquetes.
 
 JUGAR
-- Multijugador / Freerun: ./jugar-multijugador.sh
-- Zombies: ./jugar-zombies.sh
+- Multijugador / Freerun: BO3Recomp-mp (doble clic).
+- Zombies: BO3Recomp-zm (doble clic).
 - Teclado y mouse o mando. F1 = opciones (resolución, FPS, pantalla completa),
   F2 = contador de FPS, F11 = pantalla completa.
 - Online: la primera vez te pide crear una cuenta (usuario, contraseña, email). Tu
   progreso se guarda en la nube y se comparte con la versión de Android.
+- Si el AppImage no abre con doble clic, instalá FUSE 2 (en Ubuntu/Debian:
+  sudo apt install libfuse2t64; en Fedora: sudo dnf install fuse-libs).
 
 ENGLISH
-This package does not contain the game. Put your own Xbox 360 disc image (.iso), the
-game's Title Update package, the free Compatibility Packs 1 and 2 and any other DLC in the "instalar" folder and start
-jugar-multijugador.sh or jugar-zombies.sh: the first run installs and verifies the game.
+This package does not contain the game. Put the AppImage, a folder called "instalar" with your own
+Xbox 360 disc image (.iso), the Title Update, the Compatibility Packs 1 + 2 and any other DLC
+in one folder, and open the AppImage: the first run installs and verifies the game.
