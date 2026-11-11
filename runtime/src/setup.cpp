@@ -591,7 +591,7 @@ bool SetupGameData()
             int pct = total ? int(done * 100 / total) : 100;
             if (pct / 10 != lastPct / 10) { lastPct = pct; Log("setup: disc %d%%", pct); }
         });
-        if (!ok) { fs::remove_all(tmp, ec); return Fail("No se pudo extraer la imagen del disco (.zar): " + err + "\n\nSi dice \"Disk quota\" o \"No space\", falta espacio libre: hacen falta unos 8 GB.");
+        if (!ok) { fs::remove_all(tmp, ec); return Fail("No se pudo extraer la imagen del disco (.zar): " + err + "\n\nSi dice \"Disk quota\" o \"No space\", falta espacio libre: hacen falta unos 8 GB.");  }
         fs::remove_all(kGameDir, ec);
         fs::rename(tmp, kGameDir, ec);
         if (ec) return Fail("No se pudo terminar la extracción del disco: " + ec.message());
