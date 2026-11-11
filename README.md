@@ -1,5 +1,10 @@
 # Black Ops III (Xbox 360) — Linux native static recompilation
 
+> **Proyecto personal, muy beta.** Es más un experimento en marcha que un juego terminado: se rompe, cambia seguido y
+> hay cosas sin terminar. Para novedades, dudas y avisos de versiones nuevas: **[Discord de BO3 Recomp](https://discord.gg/zr2nxmc9E)**.
+
+
+
 Goal: run *Call of Duty: Black Ops III* (Xbox 360 version, title ID `4156091D`) natively on
 Linux, using **static recompilation** (PowerPC → C++ → x86-64), the approach used by
 [Unleashed Recompiled](https://github.com/hedge-dev/UnleashedRecomp). This is not an emulator.
