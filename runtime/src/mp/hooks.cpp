@@ -73,15 +73,14 @@ PPC_FUNC(sub_82A988F8)
     if (BinkLog() && n++ < 6) Log("bink 82A988F8(0x%X) -> 0x%X", a3, ctx.r3.u32);
 }
 
-// Cinematic_Play(const char* name, ...). The boot logo movie never advances yet (Bink's async
-// decode path stalls), which keeps the engine on the loading screen. Skip it unless
-// BO3_PLAY_INTRO is set.
+// Cinematic_Play(const char* name, ...). The boot logo movie plays (Bink decodes it, ~3 s); set
+// BO3_SKIP_INTRO=1 to skip it.
 PPC_FUNC_IMPL(__imp__sub_822C09A0);
 PPC_FUNC(sub_822C09A0)
 {
     std::string name = ctx.r3.u32 ? GuestString(ctx.r3.u32) : "";
     Log("cinematic: play \"%s\" (flags 0x%X)", name.c_str(), ctx.r4.u32);
-    if (!getenv("BO3_PLAY_INTRO") && name.find("Global_Logo") != std::string::npos)
+    if (getenv("BO3_SKIP_INTRO") && name.find("Global_Logo") != std::string::npos)
     {
         Log("cinematic: skipping intro movie");
         return;

@@ -53,7 +53,7 @@ or Downloads ("all files access" is asked for). User instructions: `docs/LEEME-*
 | Audio | ✅ XAudio frames (5.1) downmixed to stereo on SDL audio, paced by the device; **XMA hardware decoder emulated** (MMIO register traps + FFmpeg `xma2`) - music, UI and in-game sound |
 | Input | ✅ SDL3 gamepad, **keyboard + mouse look** (PC-style layout) → XInput pad 0 |
 | Window | ✅ SDL3 (Wayland/X11), resizable, HiDPI, **F1 video options (resolution, fullscreen on/off, saved in `bo3recomp.ini`)**, F11 / Alt+Enter / `--fullscreen` / `--windowed`, letterboxed |
-| Video (Bink) | ❌ movies don't advance (async decode path stalls); the boot logo movie is skipped (`BO3_PLAY_INTRO=1` to try it) |
+| Video (Bink) | ✅ the boot logo movie plays (~3 s, then the Activision logo); `BO3_SKIP_INTRO=1` skips it. Menu background movies: still being checked |
 
 ## Layout
 
@@ -407,7 +407,7 @@ Known renderer problems (next work):
 * A few textures are still garbage (Bink-driven screens: movies don't play), stacked 2D-array textures and
   linear mip chains not supported, 3D textures have no mips.
 * memexport draws (menus) end the rendering pass + full barrier each.
-* **Bink**: movies never advance (menu backgrounds are black; boot logo skipped).
+* **Bink**: the boot logo plays now; the menu background movies (sittingbull) still need checking.
 * ~30 fps in game, ~2500 draws/frame: per-draw constant upload (2 × 5 KB) and descriptor sets are the next
   CPU costs; texture format 23 is not supported yet.
 * Not yet: mip levels, 3D/cube textures, MSAA, EDRAM aliasing between formats, gamma, memexport, depth
