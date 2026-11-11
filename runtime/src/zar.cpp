@@ -8,6 +8,7 @@
 #include "zar.h"
 
 #include <cstdint>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -126,7 +127,7 @@ struct Walker
             if (!o) { err = "cannot write " + dst.string(); return false; }
             bool ok = r.ReadRange(off, size, o);
             ok = fclose(o) == 0 && ok;
-            if (!ok) { err = "reading " + path; return false; }
+            if (!ok) { err = path + " (" + std::string(strerror(errno)) + ")"; return false; }
             onFile(path, size);
             return true;
         }
