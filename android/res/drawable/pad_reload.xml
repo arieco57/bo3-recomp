@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- on-screen controller icon (VirtualPad.java), 24x24 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+    <path android:strokeColor="#FFFFFFFF" android:strokeLineCap="round" android:strokeLineJoin="round" android:strokeWidth="2.4" android:pathData="M19,12 A7,7 0 1,1 16.95,7.05"/>
+    <path android:fillColor="#FFFFFFFF" android:pathData="M19.6,9.7 L18.3,3.9 L13.9,8.3 Z"/>
+</vector>

@@ -33,7 +33,7 @@
 namespace
 {
 SDL_Gamepad* s_pad = nullptr;
-struct AutoPress { double t; uint16_t buttons; bool done; };
+struct AutoPress { double t; uint32_t buttons; bool done; };
 std::vector<AutoPress> s_auto;
 auto s_start = std::chrono::steady_clock::now();
 
@@ -53,17 +53,95 @@ float s_mouseYaw = 0;                             // mouse yaw degrees not yet h
 std::atomic<double> s_lastLookTake{ -10.0 };      // last time the game hook consumed them
 bool DirectLookActive();
 
-uint16_t ButtonByName(const std::string& n)
+// autopress / press file only: triggers and stick directions (held for the press, 0.25 s; repeat
+// a name to hold longer, e.g. "LSU,LSU,LSU" walks forward)
+constexpr uint32_t kPseudoRT = 0x10000, kPseudoLT = 0x20000, kLsUp = 0x40000, kLsDown = 0x80000, kLsLeft = 0x100000,
+                   kLsRight = 0x200000, kRsLeft = 0x400000, kRsRight = 0x800000, kRsUp = 0x1000000, kRsDown = 0x2000000;
+uint32_t ButtonByName(const std::string& n)
 {
-    static const struct { const char* n; uint16_t b; } map[] = {
+    static const struct { const char* n; uint32_t b; } map[] = {
         { "START", PAD_START }, { "BACK", PAD_BACK }, { "A", PAD_A }, { "B", PAD_B }, { "X", PAD_X }, { "Y", PAD_Y },
         { "UP", PAD_DPAD_UP }, { "DOWN", PAD_DPAD_DOWN }, { "LEFT", PAD_DPAD_LEFT }, { "RIGHT", PAD_DPAD_RIGHT },
-        { "LB", PAD_LB }, { "RB", PAD_RB } };
+        { "LB", PAD_LB }, { "RB", PAD_RB },
+        { "RT", kPseudoRT }, { "LT", kPseudoLT }, { "LSU", kLsUp }, { "LSD", kLsDown }, { "LSL", kLsLeft }, { "LSR", kLsRight },
+        { "RSL", kRsLeft }, { "RSR", kRsRight }, { "RSU", kRsUp }, { "RSD", kRsDown } };
     for (auto& m : map) if (n == m.n) return m.b;
     return 0;
 }
 
 double Now() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - s_start).count(); }
+
+#ifdef BO3_INPUT_TOOLS   // (off: not in phone or release builds; -DBO3_INPUT_TOOLS for local tests)
+// Input recording / replay, to repeat a real play session in tests (times from process start):
+//   BO3_INPUT_RECORD=<file>  writes the pad state whenever it changes, and the touch look degrees
+//   BO3_INPUT_REPLAY=<file>  plays such a file back (merged with live input)
+// Lines: "<seconds> <buttons hex> <lt> <rt> <lx> <ly> <rx> <ry> <look yaw> <look pitch>".
+float s_recYaw = 0, s_recPitch = 0;   // touch look since the last update (s_lookLock)
+struct RecLine { double t; HostPadState st; float yaw, pitch; };
+void RecordOrReplay(double t, HostPadState& st)
+{
+    static FILE* rec = [] { const char* p = getenv("BO3_INPUT_RECORD"); FILE* f = p ? fopen(p, "w") : nullptr; if (f) Log("input: recording to %s", p); return f; }();
+    static std::vector<RecLine> play = [] {
+        std::vector<RecLine> v;
+        const char* p = getenv("BO3_INPUT_REPLAY");
+        FILE* f = p ? fopen(p, "r") : nullptr;
+        if (!f) { if (p) LogWarn("input: cannot open replay %s", p); return v; }
+        RecLine l{};
+        unsigned b; int lt, rt, lx, ly, rx, ry;
+        while (fscanf(f, "%lf %x %d %d %d %d %d %d %f %f", &l.t, &b, &lt, &rt, &lx, &ly, &rx, &ry, &l.yaw, &l.pitch) == 10)
+        {
+            l.st.buttons = uint16_t(b); l.st.leftTrigger = uint8_t(lt); l.st.rightTrigger = uint8_t(rt);
+            l.st.lx = int16_t(lx); l.st.ly = int16_t(ly); l.st.rx = int16_t(rx); l.st.ry = int16_t(ry);
+            v.push_back(l);
+        }
+        fclose(f);
+        Log("input: replaying %zu changes from %s (%.0f s)", v.size(), p, v.empty() ? 0.0 : v.back().t);
+        return v;
+    }();
+    if (rec)
+    {
+        static HostPadState last;
+        float yaw, pitch;
+        {
+            std::lock_guard lock(s_lookLock);
+            yaw = s_recYaw; pitch = s_recPitch;
+            s_recYaw = s_recPitch = 0;
+        }
+        if (memcmp(&last, &st, sizeof(st)) != 0 || yaw != 0 || pitch != 0)
+        {
+            last = st;
+            fprintf(rec, "%.4f %04x %u %u %d %d %d %d %.4f %.4f\n", t, st.buttons, st.leftTrigger, st.rightTrigger, st.lx, st.ly, st.rx, st.ry, yaw, pitch);
+            fflush(rec);
+        }
+    }
+    if (!play.empty())
+    {
+        static size_t next = 0;
+        static HostPadState cur;
+        float yaw = 0, pitch = 0;
+        for (; next < play.size() && play[next].t <= t; next++)
+        {
+            cur = play[next].st;
+            yaw += play[next].yaw; pitch += play[next].pitch;
+            if (next + 1 == play.size()) Log("input: replay finished");
+        }
+        auto pick = [](int16_t a, int16_t b) { return std::abs(int(a)) >= std::abs(int(b)) ? a : b; };
+        st.buttons |= cur.buttons;
+        st.leftTrigger = std::max(st.leftTrigger, cur.leftTrigger);
+        st.rightTrigger = std::max(st.rightTrigger, cur.rightTrigger);
+        st.lx = pick(st.lx, cur.lx); st.ly = pick(st.ly, cur.ly); st.rx = pick(st.rx, cur.rx); st.ry = pick(st.ry, cur.ry);
+        if (yaw != 0 || pitch != 0)
+        {
+            std::lock_guard lock(s_lookLock);
+            s_lookYaw += yaw / std::max(0.1f, s_yawRatio);
+            s_lookPitch += pitch;
+        }
+    }
+}
+#else
+float s_recYaw = 0, s_recPitch = 0;
+void RecordOrReplay(double, HostPadState&) {}
+#endif
 
 // on-screen controller (Android VirtualPad.java): merged with the physical gamepad
 std::atomic<uint32_t> s_vpButtons{ 0 };
@@ -722,13 +800,31 @@ void HostInputUpdate()
             remove(pressFile);
             buf[n] = 0;
             double at = t + 0.1;
-            for (char* tok = strtok(buf, ", \r\n"); tok; tok = strtok(nullptr, ", \r\n"), at += 0.6)
-                s_auto.push_back({ at, ButtonByName(tok), false });
+            for (char* tok = strtok(buf, ", \r\n"); tok; tok = strtok(nullptr, ", \r\n"))
+            {
+                uint32_t b = ButtonByName(tok);
+                s_auto.push_back({ at, b, false });
+                at += b > 0xFFFF ? 0.25 : 0.6;   // sticks / triggers back to back (held), buttons apart (taps)
+            }
         }
     }
     for (auto& ap : s_auto)
-        if (t >= ap.t && t < ap.t + 0.25) st.buttons |= ap.buttons;
+        if (t >= ap.t && t < ap.t + 0.25)
+        {
+            st.buttons |= uint16_t(ap.buttons & 0xFFFF);
+            if (ap.buttons & kPseudoRT) st.rightTrigger = 255;
+            if (ap.buttons & kPseudoLT) st.leftTrigger = 255;
+            if (ap.buttons & kLsUp) st.ly = 32767;
+            if (ap.buttons & kLsDown) st.ly = -32767;
+            if (ap.buttons & kLsLeft) st.lx = -32767;
+            if (ap.buttons & kLsRight) st.lx = 32767;
+            if (ap.buttons & kRsLeft) st.rx = -20000;
+            if (ap.buttons & kRsRight) st.rx = 20000;
+            if (ap.buttons & kRsUp) st.ry = 20000;
+            if (ap.buttons & kRsDown) st.ry = -20000;
+        }
         else if (t >= ap.t + 0.25 && !ap.done) { ap.done = true; Log("input: autopress %.1fs done", ap.t); }
+    RecordOrReplay(t, st);
     InputSetPad(st);
 }
 
@@ -806,8 +902,13 @@ void HostInputApplyLookRates(uint32_t client)
     // `degrees` (sensitivity 1.0 = 0.055 deg per count). BO3_LOOK_GAIN scales both (tuning).
     static const float gain = getenv("BO3_LOOK_GAIN") ? float(atof(getenv("BO3_LOOK_GAIN"))) : 1.0f;
     constexpr float kYawFactor = 111.6f, kPitchFactor = 49.3f;
-    wrf(client + 12708, rdf(client + 12708) - gain * s_yawRatio * dyaw / dt / kYawFactor);
-    wrf(client + 12704, rdf(client + 12704) + gain * (invert ? -dpitch : dpitch) / dt / kPitchFactor);
+    // The game applies the stored rates once per frame without its frame time: a frame turns
+    // rate x factor x 8.92 ms whatever the frame rate (measured, BO3_MOUSE_TEST at 30 / 60 / 120 /
+    // 240 fps: 48 / 96 / 193 / 383 degrees for 180 asked when divided by the frame time - the
+    // touch / mouse look was 4x too slow at a phone's 30 fps and 2.7x too fast at 300).
+    constexpr float kFrameSlice = 0.00892f;
+    wrf(client + 12708, rdf(client + 12708) - gain * s_yawRatio * dyaw / kFrameSlice / kYawFactor);
+    wrf(client + 12704, rdf(client + 12704) + gain * (invert ? -dpitch : dpitch) / kFrameSlice / kPitchFactor);
 }
 
 void HostInputApplyMouseLook(uint32_t clientState, uint32_t cmd)
@@ -854,5 +955,17 @@ extern "C" JNIEXPORT void JNICALL Java_com_bo3recomp_VirtualPad_nativeUpdate(JNI
     s_vpAxes[4] = int32_t(std::clamp(lt, 0.0f, 1.0f) * 255.0f);
     s_vpAxes[5] = int32_t(std::clamp(rt, 0.0f, 1.0f) * 255.0f);
     s_vpButtons = uint32_t(buttons) & 0xFFFF;
+}
+
+// VirtualPad.nativeLook(yaw, pitch): swipe-to-aim degrees (right / down positive), through the
+// direct look path like the mouse (the yaw ratio is the mouse's, so it is divided out here)
+extern "C" JNIEXPORT void JNICALL Java_com_bo3recomp_VirtualPad_nativeLook(JNIEnv*, jclass, jfloat yaw, jfloat pitch)
+{
+    if (!std::isfinite(yaw) || !std::isfinite(pitch)) return;
+    std::lock_guard lock(s_lookLock);
+    s_lookYaw += yaw / std::max(0.1f, s_yawRatio);
+    s_lookPitch += pitch;
+    s_recYaw += yaw;   // (BO3_INPUT_RECORD)
+    s_recPitch += pitch;
 }
 #endif
