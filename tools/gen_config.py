@@ -54,13 +54,16 @@ patched_file_path = "../private/{m}/default_patched.xex"
 out_directory_path = "../ppc/{m}"
 switch_table_file_path = "BO3_{M}_switch_tables.toml"
 
-# Optimizations: keep OFF until the recompilation runs correctly (README recommendation).
+# Optimizations: the special registers live in C++ locals instead of the context in memory (the
+# compiler keeps them in host registers; with -fno-strict-aliasing every guest store would otherwise
+# force them back to memory). LR stays in the context: the runtime's hooks and backtraces read it.
+# r0-r31 stay in the context too: setjmp / longjmp and the save/restore helpers pass them through it.
 skip_lr = false
-skip_msr = false
-ctr_as_local = false
-xer_as_local = false
-reserved_as_local = false
-cr_as_local = false
+skip_msr = true
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
 non_argument_as_local = false
 non_volatile_as_local = false
 

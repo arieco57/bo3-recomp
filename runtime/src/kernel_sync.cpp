@@ -147,27 +147,29 @@ GUEST_IMPORT(KeQueryBasePriorityThread)
     RETURN(uint32_t(t ? t->priority : 0));
 }
 
-// Guest yields (Sleep(0) / SwitchToThread): the game's job workers spin on them while idle.
-// Cheap on the console's 6 hardware threads; on a phone (2 big cores) the spinning threads
-// take CPU time from the ones doing the work - after a run of yields, sleep briefly instead.
-static void GuestYield()
+// Guest yields (Sleep(0) / SwitchToThread) and zero-timeout waits that find nothing: the game's
+// threads (Main, 2_Backend, 3_Server, job workers) spin on them while idle. Free on the console's
+// 6 hardware threads; on a PC it keeps 3 cores at 100% even with the frame rate capped (a laptop
+// heats up and slows down after a while), on a phone it takes CPU time from the threads doing the
+// work. After a quick run of them, sleep briefly instead. BO3_NO_SPIN_BACKOFF=1 disables it.
+static void SpinBackoff()
 {
-#ifdef __ANDROID__
+    static const bool off = getenv("BO3_NO_SPIN_BACKOFF") != nullptr;
+    if (off) return;
     thread_local uint32_t run = 0;
     thread_local auto last = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
     run = now - last < std::chrono::microseconds(200) ? run + 1 : 0;
     last = now;
-    if (run > 16) { std::this_thread::sleep_for(std::chrono::microseconds(100)); last = std::chrono::steady_clock::now(); return; }
-#endif
+    if (run > 16) { std::this_thread::sleep_for(std::chrono::microseconds(100)); last = std::chrono::steady_clock::now(); }
+}
+
+static void GuestYield()
+{
+    SpinBackoff();
     std::this_thread::yield();
 }
 
-GUEST_IMPORT(NtYieldExecution)
-{
-    GuestYield();
-    RETURN(STATUS_SUCCESS);
-}
 
 // BO3_WAIT_PROFILE=1: time spent blocked per (guest thread, caller), logged every 2 s.
 namespace
@@ -214,6 +216,22 @@ WaitProf::~WaitProf()
         s_wp.clear();
     }
 }
+}
+
+GUEST_IMPORT(NtYieldExecution)
+{
+    if (static const char* bt = getenv("BO3_BT_YIELD"); bt)   // diagnostics: "<seconds>,<guest tid>" - who spins on yields
+    {
+        static const auto t0 = std::chrono::steady_clock::now();
+        static const uint32_t tid = strchr(bt, ',') ? uint32_t(atoi(strchr(bt, ',') + 1)) : 1;
+        static std::atomic<int> n{ 0 };
+        GuestThread* gt = CurrentThread();
+        if (gt && gt->id == tid && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > atof(bt) && n++ < 12)
+            Log("yield t%u: %s", tid, GuestBacktrace(ctx, 10).c_str());
+    }
+    WaitProf wp(ctx, "NtYieldExecution");
+    GuestYield();
+    RETURN(STATUS_SUCCESS);
 }
 
 GUEST_IMPORT(KeDelayExecutionThread)
@@ -536,6 +554,7 @@ GUEST_IMPORT(NtWaitForSingleObjectEx)
             Log("wait 0x%X: %s", ARG(3), GuestBacktrace(ctx, 16).c_str());
     }
     uint32_t st = WaitForObjects({ o }, false, GuestTimeoutToNs(ARG(6)), ARG(5) != 0);
+    if (st == STATUS_TIMEOUT && ARG(6) && GuestRead64(ARG(6)) == 0) SpinBackoff();   // a poll that found nothing
     if (static const double longMs = getenv("BO3_LONG_WAIT") ? atof(getenv("BO3_LONG_WAIT")) : 0; longMs > 0 &&
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wp.t0).count() > longMs)
     {
@@ -561,7 +580,9 @@ GUEST_IMPORT(KeWaitForMultipleObjects)
     std::vector<std::shared_ptr<KObject>> objs;
     for (uint32_t i = 0; i < ARG(3); i++) objs.push_back(ObjectFromGuest(GuestRead32(ARG(4) + i * 4)));
     WaitProf wp(ctx, "KeWaitForMultipleObjects");
-    RETURN(WaitForObjects(objs, ARG(5) == 0, GuestTimeoutToNs(ARG(9)), ARG(8) != 0));
+    uint32_t st = WaitForObjects(objs, ARG(5) == 0, GuestTimeoutToNs(ARG(9)), ARG(8) != 0);
+    if (st == STATUS_TIMEOUT && ARG(9) && GuestRead64(ARG(9)) == 0) SpinBackoff();   // a poll that found nothing
+    RETURN(st);
 }
 
 // ---------------------------------------------------------------------------------------

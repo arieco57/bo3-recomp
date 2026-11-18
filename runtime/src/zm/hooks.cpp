@@ -2,6 +2,7 @@
 // Generated guest functions are weak aliases of __imp__sub_XXXXXXXX, so defining sub_XXXXXXXX
 // here replaces them while still allowing the original to be called.
 #include "guest.h"
+#include "job_backoff.h"
 #include "live_hooks.h"
 #include "host_input.h"
 #include "video_options.h"
@@ -162,4 +163,23 @@ PPC_FUNC(sub_821C9AC8)
         gum[mode][item] = name.find("_bgb_") != std::string::npos ? 1 : 0;
     }
     if (gum[mode][item] == 1) ctx.r3.u64 = 0;
+}
+
+// Job queue workers (see job_backoff.cpp): the search for a job and the push of a job back.
+PPC_FUNC_IMPL(__imp__sub_82146978);
+PPC_FUNC(sub_82146978)
+{
+    JobBeforeSearch();
+    __imp__sub_82146978(ctx, base);
+    JobAfterSearch(ctx.r3.u8 != 0);
+}
+PPC_FUNC_IMPL(__imp__sub_82145D90);
+PPC_FUNC(sub_82145D90)
+{
+    const uint32_t lr = uint32_t(ctx.lr);
+    // a job taken and put back: by the worker loop (not ready / not finished), by the search (meant for
+    // another worker) and by the routine a thread runs jobs with while it waits; other callers queue new jobs
+    const bool putBack = lr == 0x82146CD8 || lr == 0x82146854 || lr == 0x82146F98;
+    __imp__sub_82145D90(ctx, base);
+    JobAfterPush(putBack);
 }
