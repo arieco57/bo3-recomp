@@ -24,6 +24,7 @@
 #include <unordered_set>
 #include "arch.h"
 
+
 namespace
 {
 // GPU register file. Guests access registers through MMIO at 0x7FC80000 (index * 4); here
@@ -223,8 +224,17 @@ void ExecuteSyncOp(uint32_t op, uint32_t count, DF&& D, uint32_t p)
     case PM4_WAIT_REG_MEM:
     {
         uint32_t info = D(0), addr = D(1), ref = D(2), mask = D(3);
-        // pending fence writes may be what this (or the guest after it) waits for; at most one
-        // submit per BO3_WAIT_SUBMIT_US (default 1000 us) - each is a kernel call
+        // Pending fence writes may be what this waits for: submit them - but only when memory does not
+        // satisfy the wait yet (the loop below counts pending writes as done; a guest thread polling
+        // the value later gets it from the submit made when the recorder runs out of work). Each
+        // submit ends the rendering pass, which on a tiler stores and reloads every tile: submitting
+        // at every wait split the scene into ~7 passes on a phone (Adreno 618: 6.8 -> 1.5 submits per
+        // frame, 38 -> 34 passes, +2.5% fps). At most one per BO3_WAIT_SUBMIT_US (default 1000 us).
+        // BO3_WAIT_SUBMIT: 2 = at every wait (the previous behaviour), 1 = when not satisfied, 0 = never.
+        static const int waitMode = getenv("BO3_WAIT_SUBMIT") ? atoi(getenv("BO3_WAIT_SUBMIT")) : 1;
+        bool wantSubmit = waitMode == 2;
+        if (waitMode == 1) wantSubmit = !Compare(info, ((info & 0x10) ? GpuReadMem(addr) : ReadReg(addr)) & mask, ref);
+        if (wantSubmit)
         {
             static const int64_t minUs = getenv("BO3_WAIT_SUBMIT_US") ? atoll(getenv("BO3_WAIT_SUBMIT_US")) : 1000;
             static auto lastSubmit = std::chrono::steady_clock::now();

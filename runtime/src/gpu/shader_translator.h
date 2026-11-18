@@ -9,6 +9,7 @@ struct TranslatedShader
     bool pixel = false;
     std::string glsl;
     std::vector<uint32_t> spirv;
+    std::vector<uint32_t> spirvRect, spirvQuad;   // VS without geometry shaders: rect / quad list variants
     std::string error;           // non-empty on failure
     uint32_t texturesUsed = 0;   // bitmask of texture fetch constants sampled
     uint8_t textureDim[32] = {}; // xenos::FetchOpDimension per used fetch constant
@@ -23,6 +24,10 @@ struct TranslatedShader
     uint8_t memexportConstCount = 0;
     uint64_t constChunks = ~0ull;  // float constants read, bit i = c[4i..4i+3] (all with relative addressing)
     uint64_t fetchVec4 = ~0ull;    // fetch constants read, bit i = fetch dwords 4i..4i+3
+    // vertex fetches per vertex fetch constant (0..95): bit0 used, bit1 indexed by something else than the
+    // vertex index r0.x (bone matrices...); stride and the dword range read within a vertex (copy mode uploads)
+    uint8_t vfFlags[96] = {};
+    uint16_t vfStride[96] = {}, vfMinOff[96] = {}, vfMaxEnd[96] = {};
 };
 
 // Layout shared with the renderer (std140, one block per stage):
@@ -45,3 +50,12 @@ bool CompileGlsl(bool pixel, const std::string& glsl, std::vector<uint32_t>& spi
 
 // Changes whenever the translator is rebuilt (shader disk cache invalidation).
 const char* ShaderTranslatorBuildId();
+// light shaders: plain IEEE multiplies, no inf/nan preservation (faster; see shader_translator.cpp)
+void ShaderTranslatorSetLite(bool on);
+bool ShaderTranslatorLite();
+// GPUs without geometry shaders: vertex shaders also get rect / quad list variants (set before translating)
+void ShaderTranslatorSetPrimEmu(bool on);
+bool ShaderTranslatorPrimEmu();
+// the device's Vulkan minor version (SPIR-V target) and inf/nan preservation support: part of the cache identity
+void ShaderTranslatorSetDevice(int vulkanMinor, bool floatControls);
+void ShaderCompilerSetVulkanVersion(int minor);

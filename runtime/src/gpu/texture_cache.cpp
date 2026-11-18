@@ -19,6 +19,7 @@ uint64_t TextureCacheUploadedSoFar();
 #include <set>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace xe::gpu;
@@ -33,10 +34,106 @@ struct FormatInfo
 {
     VkFormat vk = VK_FORMAT_UNDEFINED;
     uint32_t blockW = 1, blockH = 1, bytesPerBlock = 4;
-    int decode = 0;   // 0 = copy as is, 1 = 565 -> RGBA8, 2 = 1555 -> RGBA8, 3 = 4444 -> RGBA8
+    int decode = 0;   // 0 = copy as is, 1 = 565 -> RGBA8, 2 = 1555 -> RGBA8, 3 = 4444 -> RGBA8,
+                      // kDecodeBC1.. = BC1/2/3/4/5 blocks -> RGBA8 texels (GPUs without BC: Mali, PowerVR)
 };
+enum { kDecodeBC1 = 4, kDecodeBC2, kDecodeBC3, kDecodeBC4, kDecodeBC5 };
+
+// bytes one source block becomes in the upload buffer
+uint32_t OutBytes(const FormatInfo& fi)
+{
+    if (fi.decode >= kDecodeBC1) return fi.blockW * fi.blockH * 4;
+    return fi.decode ? 4 : fi.bytesPerBlock;
+}
+
+FormatInfo GetFormatRaw(xenos::TextureFormat f);
 
 FormatInfo GetFormat(xenos::TextureFormat f)
+{
+    FormatInfo fi = GetFormatRaw(f);
+    static const bool noBC = getenv("BO3_NO_BC") != nullptr;   // diagnostics: the CPU decode on any GPU
+    if (g_vk.hasBC && !noBC) return fi;
+    switch (fi.vk)
+    {
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: fi.decode = kDecodeBC1; break;
+    case VK_FORMAT_BC2_UNORM_BLOCK: fi.decode = kDecodeBC2; break;
+    case VK_FORMAT_BC3_UNORM_BLOCK: fi.decode = kDecodeBC3; break;
+    case VK_FORMAT_BC4_UNORM_BLOCK: fi.decode = kDecodeBC4; break;
+    case VK_FORMAT_BC5_UNORM_BLOCK: fi.decode = kDecodeBC5; break;
+    default: return fi;
+    }
+    fi.vk = VK_FORMAT_R8G8B8A8_UNORM;
+    return fi;
+}
+
+// BC block (little-endian, already endian-swapped) -> 4x4 RGBA8 texels at `out` (row pitch in bytes)
+void DecodeColorBlock(const uint8_t* b, uint8_t* out, uint32_t pitch, bool alpha1bit)
+{
+    uint32_t c0 = b[0] | (b[1] << 8), c1 = b[2] | (b[3] << 8);
+    uint32_t idx = b[4] | (b[5] << 8) | (b[6] << 16) | (uint32_t(b[7]) << 24);
+    uint8_t pal[4][4];
+    auto rgb = [](uint32_t c, uint8_t* p) {
+        p[0] = uint8_t(((c >> 11) & 31) * 255 / 31); p[1] = uint8_t(((c >> 5) & 63) * 255 / 63); p[2] = uint8_t((c & 31) * 255 / 31); p[3] = 255;
+    };
+    rgb(c0, pal[0]);
+    rgb(c1, pal[1]);
+    if (c0 > c1 || !alpha1bit)
+        for (int k = 0; k < 3; k++)
+        {
+            pal[2][k] = uint8_t((2 * pal[0][k] + pal[1][k] + 1) / 3);
+            pal[3][k] = uint8_t((pal[0][k] + 2 * pal[1][k] + 1) / 3);
+        }
+    else
+        for (int k = 0; k < 3; k++) { pal[2][k] = uint8_t((pal[0][k] + pal[1][k]) / 2); pal[3][k] = 0; }
+    pal[2][3] = 255;
+    pal[3][3] = (c0 > c1 || !alpha1bit) ? 255 : 0;
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) memcpy(out + y * pitch + x * 4, pal[(idx >> (2 * (y * 4 + x))) & 3], 4);
+}
+
+// BC4-style 8-byte block -> one channel of 4x4 texels (`out` already points at the channel)
+void DecodeAlphaBlock(const uint8_t* b, uint8_t* out, uint32_t pitch)
+{
+    uint32_t a0 = b[0], a1 = b[1];
+    uint64_t idx = 0;
+    for (int k = 0; k < 6; k++) idx |= uint64_t(b[2 + k]) << (8 * k);
+    uint8_t pal[8] = { uint8_t(a0), uint8_t(a1) };
+    if (a0 > a1)
+        for (int k = 1; k < 7; k++) pal[k + 1] = uint8_t(((7 - k) * a0 + k * a1 + 3) / 7);
+    else
+    {
+        for (int k = 1; k < 5; k++) pal[k + 1] = uint8_t(((5 - k) * a0 + k * a1 + 2) / 5);
+        pal[6] = 0; pal[7] = 255;
+    }
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) out[y * pitch + x * 4] = pal[(idx >> (3 * (y * 4 + x))) & 7];
+}
+
+void DecodeBCBlock(int decode, const uint8_t* b, uint8_t* out, uint32_t pitch)
+{
+    switch (decode)
+    {
+    case kDecodeBC1: DecodeColorBlock(b, out, pitch, true); break;
+    case kDecodeBC2:
+        DecodeColorBlock(b + 8, out, pitch, false);
+        for (int t = 0; t < 16; t++)
+        {
+            uint32_t a = (b[t / 2] >> ((t & 1) * 4)) & 15;
+            out[(t / 4) * pitch + (t % 4) * 4 + 3] = uint8_t(a * 17);
+        }
+        break;
+    case kDecodeBC3: DecodeColorBlock(b + 8, out, pitch, false); DecodeAlphaBlock(b, out + 3, pitch); break;
+    case kDecodeBC4:
+    case kDecodeBC5:
+        for (int y = 0; y < 4; y++)
+            for (int x = 0; x < 4; x++) { uint8_t* t = out + y * pitch + x * 4; t[0] = t[1] = t[2] = 0; t[3] = 255; }
+        DecodeAlphaBlock(b, out, pitch);
+        if (decode == kDecodeBC5) DecodeAlphaBlock(b + 8, out + 1, pitch);
+        break;
+    }
+}
+
+FormatInfo GetFormatRaw(xenos::TextureFormat f)
 {
     switch (f)
     {
@@ -133,6 +230,8 @@ struct Cache
     VkDescriptorSet untileSet[2] = {};
     uint32_t untileOffset = 0;
     bool untileFailed = false;
+    bool untileBroken = false;   // the self-test failed: CPU untiling
+    bool remapBroken = false;    // 3D storage image writes unreliable (old drivers): 3D textures from guest memory
     uint64_t uploaded = 0;
     uint64_t poolSerial = 0;
     // Descriptor sets by content, kept across frames (allocated from persistent pools).
@@ -486,9 +585,11 @@ std::vector<LevelSrc> GetLevels(const xenos::xe_gpu_texture_fetch_t& f, const Fo
 void DecodeLevel(uint8_t* dst, const LevelSrc& lv, uint32_t layers, const xenos::xe_gpu_texture_fetch_t& f, const FormatInfo& fi, bool is3D,
                  uint32_t heightAligned)
 {
-    uint32_t outBpb = fi.decode ? 4 : fi.bytesPerBlock;
+    uint32_t outBpb = OutBytes(fi);
     uint32_t log2Bpb = __builtin_ctz(fi.bytesPerBlock);
     uint32_t sliceOut = lv.bw * lv.bh * outBpb;
+    const bool bc = fi.decode >= kDecodeBC1;
+    const uint32_t texPitch = lv.bw * fi.blockW * 4;   // BC decode: texel rows
     for (uint32_t z = 0; z < layers; z++)
         for (uint32_t y = 0; y < lv.bh; y++)
             for (uint32_t x = 0; x < lv.bw; x++)
@@ -503,7 +604,19 @@ void DecodeLevel(uint8_t* dst, const LevelSrc& lv, uint32_t layers, const xenos:
                 if (srcOff >= 0x20000000u - (lv.base - 0xA0000000u)) continue;
                 const uint8_t* src = g_base + lv.base + srcOff;
                 uint8_t* d = dst + z * sliceOut + (y * lv.bw + x) * outBpb;
-                if (!fi.decode)
+                if (bc)
+                {
+                    uint8_t blk[16];
+                    for (uint32_t k = 0; k < fi.bytesPerBlock; k += 4)
+                    {
+                        uint32_t v;
+                        memcpy(&v, src + k, 4);
+                        v = Swap(v, f.endianness);
+                        memcpy(blk + k, &v, 4);
+                    }
+                    DecodeBCBlock(fi.decode, blk, dst + z * sliceOut + y * fi.blockH * texPitch + x * fi.blockW * 4, texPitch);
+                }
+                else if (!fi.decode)
                 {
                     for (uint32_t k = 0; k < fi.bytesPerBlock; k += 4)
                     {
@@ -607,6 +720,7 @@ constexpr uint32_t kUntileSize = 64 * 1024 * 1024;
 
 bool InitUntile()
 {
+    if (c.untileBroken) return false;
     if (c.untilePipe) return true;
     if (c.untileFailed || !g_vk.guestBuffer) return false;
     c.untileFailed = true;
@@ -679,7 +793,7 @@ bool Upload(VkCommandBuffer cmd, TexEntry& e, const xenos::xe_gpu_texture_fetch_
         levels = GetLevels(f, fi, width, height, depth);
     levels.resize(std::min<size_t>(levels.size(), e.img.mips));
 
-    uint32_t outBpb = fi.decode ? 4 : fi.bytesPerBlock;
+    uint32_t outBpb = OutBytes(fi);
     uint32_t total = 0;
     for (auto& lv : levels) total += (lv.bw * lv.bh * outBpb * depth + 15) & ~15u;
 
@@ -688,6 +802,11 @@ bool Upload(VkCommandBuffer cmd, TexEntry& e, const xenos::xe_gpu_texture_fetch_
     if (!fi.decode && !cpuUntile && goff + total <= kUntileSize && InitUntile())
     {
         endPass();
+        // copy mode: the texture's memory goes up to the GPU's copy first (what the GPU itself wrote there -
+        // memexport, resolves - stays: it is newer than the CPU side until copied back)
+        if (WatchNeedsRequests())
+            for (auto& lv : levels)
+                WatchRequestUpload(lv.base - 0xA0000000u, std::max<uint32_t>(lv.sliceStride * std::max(depth, 1u), lv.pitchAligned * l.heightAligned * fi.bytesPerBlock));
         VkCommandBuffer cb = cmd;
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, c.untilePipe);
         g_computeDispatched = true;
@@ -721,7 +840,7 @@ bool Upload(VkCommandBuffer cmd, TexEntry& e, const xenos::xe_gpu_texture_fetch_
         VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         di.memoryBarrierCount = 1;
         di.pMemoryBarriers = &mb;
-        vkCmdPipelineBarrier2(cb, &di);
+        VkCmdBarrier2(cb, &di);
         VkTransition(cb, e.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         vkCmdCopyBufferToImage(cb, c.untileBuf[c.frame].buffer, e.img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(copies.size()), copies.data());
         VkTransition(cb, e.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -740,6 +859,7 @@ bool Upload(VkCommandBuffer cmd, TexEntry& e, const xenos::xe_gpu_texture_fetch_
         DecodeLevel(dstBase + pos, lv, depth, f, fi, is3D, l.heightAligned);
         VkBufferImageCopy bic{};
         bic.bufferOffset = off + pos;
+        if (fi.decode >= kDecodeBC1) { bic.bufferRowLength = lv.bw * fi.blockW; bic.bufferImageHeight = lv.bh * fi.blockH; }
         bic.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, i, 0, is3D ? 1u : depth };
         bic.imageExtent = { lv.width, lv.height, is3D ? depth : 1u };
         copies.push_back(bic);
@@ -838,6 +958,8 @@ bool Remap3DFromResolve(VkCommandBuffer cmd, uint32_t phys, VkImageObj& src, con
                         uint32_t h, uint32_t d, VkDescriptorImageInfo& out, const std::function<void()>& endPass)
 {
     if (f.format != xenos::TextureFormat::k_8_8_8_8 || src.format != VK_FORMAT_R8G8B8A8_UNORM || !f.tiled) return false;
+    static const bool noRemap = getenv("BO3_NO_REMAP") != nullptr;
+    if (noRemap || c.remapBroken) return false;
     if (!InitRemap()) return false;
     auto key = std::make_tuple(phys, src.image, w, h, d);
     auto& e = c.remaps[key];
@@ -955,7 +1077,36 @@ bool ResolveFetch(VkCommandBuffer cmd, uint32_t t, TexKind kind, VkDescriptorIma
     if (f.type != xenos::FetchConstantType::kTexture) return false;
     uint32_t phys = (f.base_address << 12) & 0x1FFFFFFF;
     bool depthFetch = f.format == xenos::TextureFormat::k_24_8 || f.format == xenos::TextureFormat::k_24_8_FLOAT;
-    out.sampler = Sampler(fs, depthFetch);
+    // Depth (24_8) fetches: point-sampled unless BO3_DEPTH_FILTER=1 and the depth format filters
+    // linearly here (Xenos filters 24-bit depth like any unorm texture)
+    static const bool depthFilter = [] {
+        if (!getenv("BO3_DEPTH_FILTER")) return false;
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g_vk.phys, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
+        bool ok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) || getenv("BO3_DEPTH_FILTER_FORCE");
+        Log("texture: depth fetches filtered %s", ok ? "linearly" : "- not supported by the depth format, point");
+        return ok;
+    }();
+    // formats this GPU cannot filter linearly (32-bit float on Adreno stock drivers, some Mali): point
+    // sampling - linear filtering of them is undefined there (black)
+    bool noLinear = false;
+    {
+        static std::map<VkFormat, bool> filters;
+        VkFormat hf = depthFetch ? VK_FORMAT_UNDEFINED : GetFormatRaw(f.format).vk;
+        if (hf != VK_FORMAT_UNDEFINED)
+        {
+            auto it = filters.find(hf);
+            if (it == filters.end())
+            {
+                VkFormatProperties fp;
+                vkGetPhysicalDeviceFormatProperties(g_vk.phys, hf, &fp);
+                it = filters.emplace(hf, (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0).first;
+                if (!it->second) Log("texture: format %d cannot be filtered linearly on this GPU: point sampling", int(hf));
+            }
+            noLinear = !it->second;
+        }
+    }
+    out.sampler = Sampler(fs, (depthFetch && !depthFilter) || noLinear);
     out.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
     // Render-to-texture (2D): sample the resolved image directly (same-frame, exact values).
@@ -1108,6 +1259,105 @@ bool ResolveFetch(VkCommandBuffer cmd, uint32_t t, TexKind kind, VkDescriptorIma
 }
 }
 
+// GPU untiling self-test: a known tiled, byte-swapped 32x32 texture untiled by the compute shader and
+// compared with the CPU's result. Drivers that get it wrong (the Adreno stock driver of Android 11-13
+// returns zeros: the colour-grading LUT went black, and with it every 3D scene) untile on the CPU.
+static int TiledAddr2D(int x, int y, uint32_t pitchAligned, uint32_t log2bpb)
+{
+    int outer = ((y >> 5) * int(pitchAligned >> 5) + (x >> 5)) << 6;
+    int inner = (((y >> 1) & 7) << 3) | (x & 7);
+    int oib = (outer | inner) << int(log2bpb);
+    int bank = (y >> 4) & 1;
+    int pipe = ((x >> 3) & 3) ^ (((y >> 3) & 1) << 1);
+    return ((y & 1) << 4) | (pipe << 6) | (bank << 11) | (oib & 15) | (((oib >> 4) & 1) << 5) | (((oib >> 5) & 7) << 8) | ((oib >> 8) << 12);
+}
+
+static void UntileSelfTest()
+{
+    // Vulkan 1.1 drivers (Adreno stock drivers of Android 11-13): GPU untiling of what the GPU itself wrote
+    // (the colour-grading LUT's resolve) reads zeros there even when this test passes, and the 3D remap's
+    // storage image writes lose the device: both on the CPU (BO3_GPU_UNTILE=1 keeps them on the GPU)
+    if (g_vk.props.apiVersion < VK_API_VERSION_1_2 && !getenv("BO3_GPU_UNTILE"))
+    {
+        c.untileBroken = c.remapBroken = true;
+        Log("texture: Vulkan 1.1 driver - untiling and 3D textures on the CPU");
+        return;
+    }
+    if (getenv("BO3_CPU_UNTILE") || getenv("BO3_NO_UNTILE_TEST") || !InitUntile()) return;
+    const uint32_t kSrcWords = 16384, kOut = 1024;
+    VkBufferObj src = VkCreateBuffer(kSrcWords * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    VkBufferObj out = VkCreateBuffer(kOut * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    uint32_t* sp = static_cast<uint32_t*>(src.mapped);
+    for (uint32_t i = 0; i < kSrcWords; i++) sp[i] = i * 2654435761u ^ 0x5A5A1234u;
+    memset(out.mapped, 0, kOut * 4);
+    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+    VkDescriptorPoolCreateInfo dp{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    dp.maxSets = 1; dp.poolSizeCount = 1; dp.pPoolSizes = &ps;
+    VkDescriptorPool pool;
+    VK_CHECK(vkCreateDescriptorPool(g_vk.device, &dp, nullptr, &pool));
+    VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    ai.descriptorPool = pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &c.untileSetLayout;
+    VkDescriptorSet set;
+    VK_CHECK(vkAllocateDescriptorSets(g_vk.device, &ai, &set));
+    VkDescriptorBufferInfo bi0{ src.buffer, 0, VK_WHOLE_SIZE }, bi1{ out.buffer, 0, VK_WHOLE_SIZE };
+    VkWriteDescriptorSet w[2] = {};
+    w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi0, nullptr };
+    w[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi1, nullptr };
+    vkUpdateDescriptorSets(g_vk.device, 2, w, 0, nullptr);
+    VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    pci.queueFamilyIndex = g_vk.queueFamily;
+    VkCommandPool cpool;
+    VK_CHECK(vkCreateCommandPool(g_vk.device, &pci, nullptr, &cpool));
+    VkCommandBufferAllocateInfo cai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cai.commandPool = cpool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+    VkCommandBuffer cb;
+    VK_CHECK(vkAllocateCommandBuffers(g_vk.device, &cai, &cb));
+    VkCommandBufferBeginInfo cbi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(cb, &cbi));
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, c.untilePipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, c.untileLayout, 0, 1, &set, 0, nullptr);
+    // 32x32 blocks of 4 bytes, tiled, 8-in-32 endian swap: like a typical 8888 texture
+    uint32_t pcv[16] = { 0, 0, 32, 32, 1, 32, 32, 0, 4096, 2, 1, 2, kOut, 0, 32, 0 };
+    vkCmdPushConstants(cb, c.untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, pcv);
+    vkCmdDispatch(cb, kOut / 64, 1, 1);
+    VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    VK_CHECK(vkEndCommandBuffer(cb));
+    VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence;
+    VK_CHECK(vkCreateFence(g_vk.device, &fci, nullptr, &fence));
+    VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+    VK_CHECK(vkQueueSubmit(g_vk.queue, 1, &si, fence));
+    VK_CHECK(vkWaitForFences(g_vk.device, 1, &fence, VK_TRUE, 5000000000ull));
+    const uint32_t* op = static_cast<const uint32_t*>(out.mapped);
+    uint32_t bad = 0, firstBad = UINT32_MAX;
+    for (uint32_t i = 0; i < kOut; i++)
+    {
+        uint32_t a = uint32_t(TiledAddr2D(int(i % 32), int(i / 32), 32, 2));
+        uint32_t want = __builtin_bswap32(sp[(a >> 2) % kSrcWords]);
+        if (op[i] != want) { bad++; if (firstBad == UINT32_MAX) firstBad = i; }
+    }
+    const uint32_t badValue = bad ? op[firstBad] : 0;
+    vkDestroyFence(g_vk.device, fence, nullptr);
+    vkDestroyCommandPool(g_vk.device, cpool, nullptr);
+    vkDestroyDescriptorPool(g_vk.device, pool, nullptr);
+    for (VkBufferObj* b : { &src, &out })
+    {
+        vkUnmapMemory(g_vk.device, b->memory);
+        vkDestroyBuffer(g_vk.device, b->buffer, nullptr);
+        vkFreeMemory(g_vk.device, b->memory, nullptr);
+    }
+    if (bad)
+    {
+        c.untileBroken = true;
+        LogWarn("texture: GPU untiling gives wrong results on this driver (%u of %u words, first %u: 0x%08X) - untiling on the CPU",
+                bad, kOut, firstBad, badValue);
+    }
+    else Log("texture: GPU untiling self-test passed");
+}
+
 void TextureCacheInit(VkDescriptorSetLayout set1Layout)
 {
     c.layout = set1Layout;
@@ -1115,6 +1365,54 @@ void TextureCacheInit(VkDescriptorSetLayout set1Layout)
     c.dummyCube = VkCreateImage(1, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 1, 6, true);
     c.dummy3D = MakeImage3D();
     for (auto& s : c.staging) s = VkCreateBuffer(kStagingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    UntileSelfTest();
+}
+
+// Textures not fetched for a while are dropped (images, their views and - once per sweep - the
+// cached descriptor sets). Without it the cache only grew: a match keeps creating textures at
+// new addresses (streaming, dynamic ones), ~1 per frame -> 200k+ entries and growing GPU memory
+// in a long session. BO3_TEX_KEEP_FRAMES=n (default 1800 guest frames) / 0 = never.
+static void EvictUnusedTextures()
+{
+    static const uint64_t keep = getenv("BO3_TEX_KEEP_FRAMES") ? strtoull(getenv("BO3_TEX_KEEP_FRAMES"), nullptr, 10) : 1800;
+    if (!keep || c.textures.size() < 512) return;
+    std::unordered_set<VkImage> dead;
+    for (auto it = c.textures.begin(); it != c.textures.end();)
+    {
+        TexEntry& e = it->second;
+        if (e.checkedFrame != ~0ull && e.checkedFrame + keep < c.frameCounter)
+        {
+            if (e.img.image)
+            {
+                dead.insert(e.img.image);
+                VkImageObj img = e.img;
+                c.graveyard.push_back({ c.frameCounter, [img]() mutable { VkDestroyImage(img); } });
+            }
+            it = c.textures.erase(it);
+        }
+        else ++it;
+    }
+    if (dead.empty()) return;
+    for (auto it = c.views.begin(); it != c.views.end();)
+    {
+        if (dead.count(std::get<0>(it->first)))
+        {
+            VkImageView v = it->second;
+            c.graveyard.push_back({ c.frameCounter, [v] { vkDestroyImageView(g_vk.device, v, nullptr); } });
+            it = c.views.erase(it);
+        }
+        else ++it;
+    }
+    // cached descriptor sets may reference those views: retire them all (rebuilt on demand)
+    for (VkDescriptorPool pool : c.setPools)
+        c.graveyard.push_back({ c.frameCounter, [pool] { vkDestroyDescriptorPool(g_vk.device, pool, nullptr); } });
+    c.setPools.clear();
+    c.sets.clear();
+    memset(c.setFront, 0, sizeof(c.setFront));
+    c.lastSet = VK_NULL_HANDLE;
+    c.setsAllocated = 0;
+    c.bindGen++;
+    Log("texture: %zu unused textures released (%zu left)", dead.size(), c.textures.size());
 }
 
 void TextureCacheBeginFrame(uint32_t frameIndex, bool newFrame)
@@ -1124,6 +1422,7 @@ void TextureCacheBeginFrame(uint32_t frameIndex, bool newFrame)
     c.untileOffset = 0;
     c.poolSerial++;
     if (newFrame) c.frameCounter++;   // textures are re-validated once per guest frame
+    if (newFrame && c.frameCounter % 600 == 0) EvictUnusedTextures();
     // Objects retired 3+ frames ago are no longer referenced by any command buffer.
     for (auto it = c.graveyard.begin(); it != c.graveyard.end();)
     {
@@ -1208,6 +1507,10 @@ void TextureCacheForgetImage(VkImage image)
     c.setsAllocated = 0;
     c.bindGen++;
 }
+
+// diagnostics (the renderer's periodic status line): cached textures, objects waiting for destruction
+size_t TextureCacheEntries() { return c.textures.size(); }
+size_t TextureCacheGraveyard() { return c.graveyard.size(); }
 
 void TextureCacheClearResolves()
 {

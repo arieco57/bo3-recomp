@@ -9,6 +9,7 @@
 // Shaders are translated from Xenos microcode (shader_translator.cpp); vertex and index data
 // are read in the shader directly from guest memory (imported as a storage buffer).
 #include "renderer.h"
+#include "../profiler.h"
 #include "shader_translator.h"
 #include "texture_cache.h"
 #include "overlay.h"
@@ -17,6 +18,7 @@
 #include "../log.h"
 #include "../memory.h"
 #include "../write_watch.h"
+#include <unistd.h>
 
 #include "xenia/gpu/registers.h"
 
@@ -38,6 +40,7 @@
 using namespace xe::gpu;
 
 bool CompileGlslStage(int stage, const std::string& glsl, std::vector<uint32_t>& spirv, std::string& error);
+
 
 namespace
 {
@@ -84,6 +87,7 @@ struct ShaderEntry
 {
     TranslatedShader t;
     VkShaderModule module = VK_NULL_HANDLE;
+    VkShaderModule rectModule = VK_NULL_HANDLE, quadModule = VK_NULL_HANDLE;   // VS without geometry shaders
     std::atomic<int> state{ 0 };   // 0 compiling (background), 1 ready, 2 failed
     bool ok() const { return state.load(std::memory_order_acquire) == 1; }
 };
@@ -91,6 +95,9 @@ struct ShaderEntry
 struct HostRT
 {
     uint32_t base = 0, pitch = 0, format = 0, height = 0;   // pitch/height: host image (sample space x scale)
+    // EDRAM aliasing at resolves: the last draw (sequence number) into this surface, and per band of
+    // 256 guest rows the last draw that reached into it
+    uint64_t lastSeq = 0, bandSeq[8] = {};
     bool depth = false;
     VkImageObj img;
 };
@@ -125,6 +132,7 @@ struct R
     VkPipelineLayout resolveLayout = VK_NULL_HANDLE;
     VkPipeline resolvePipe = VK_NULL_HANDLE;
     std::map<uint32_t, Resolved> resolvedDepth;   // depth resolves by guest physical address
+    uint64_t drawSeq = 0;   // draws into depth surfaces (EDRAM aliasing order)
     uint64_t memexportDraws = 0;
     // GPU work that writes guest memory (resolve-to-memory, memexport): recorded in the open
     // command buffer / submitted but maybe not finished. See RendererFlushGuestWrites.
@@ -137,7 +145,7 @@ struct R
     std::vector<std::pair<uint32_t, uint32_t>> deferredWrites;   // (guest address, host bytes) of the 32-bit ones
     uint64_t guestWriteFlushes = 0;
     double shaderMs = 0, pipelineMs = 0, worstFrameMs = 0;   // stats per log interval
-    double gpuBusyMs = 0, ovGpuMs = 0, presentMs = 0;   // (ov*: overlay window accumulators)
+    double gpuBusyMs = 0, ovGpuMs = 0, presentMs = 0, acquireMs = 0;   // (ov*: overlay window accumulators)
     uint64_t barriers = 0;
     uint64_t submits = 0, fenceBatches = 0, interruptWaits = 0;
     uint32_t drawsSinceSubmit = 0;
@@ -174,20 +182,33 @@ void SubmitDeferredBatch(const VkSubmitInfo* si = nullptr);
 void CompletionThread();
 void SubmitThread();
 void QueueSync();
+void QueueOp(std::function<void()> fn);
 void SubmitRecorded();
 static uint64_t g_frameSerial = 0;   // incremented when a frame starts recording
+void RendererForgetView(VkImageView v);
+extern std::vector<std::pair<VkFramebuffer, uint64_t>> s_fbGraveyard;
 // Internal resolution multiplier: EDRAM render targets and resolve images are S times the
 // guest size in both dimensions (applied between frames; see RendererSetScale).
 static float g_scale = 1.0f;                        // 1, 1.5, 2, 3
-static std::atomic<uint32_t> g_pendingScale{ 0 };   // requested scale x 6 (0 = none)
+static std::atomic<uint32_t> g_pendingScale{ 0 };   // requested scale x 60 (0 = none)
 static int R(float v) { return int(std::lround(v)); }
 
 // Surfaces narrower than 256 samples (colour-grading LUTs, bloom chains, small effect buffers)
 // stay at 1x: no gain from resolution, and position-based math in them breaks when scaled.
+// Shadow quality (video options): 1 = high, the shadow maps at full resolution whatever the internal
+// resolution (they used to follow it: 364 px wide at 35%); 0 = low, half resolution (weak GPUs).
+// BO3's shadow maps are the only 1x surfaces of these pitches: the 1024x2048 sun cascades (1040)
+// and the 512x512 spot lights (560).
+int g_shadowQuality = 1;
+std::atomic<int> g_pendingShadows{ -1 };
+
 float SurfaceScale(uint32_t surfacePitch, uint32_t msaa)
 {
+    static const bool followScale = getenv("BO3_SHADOWS_FOLLOW_SCALE") != nullptr;   // (the old behaviour)
+    if (msaa == 0 && (surfacePitch == 1040 || surfacePitch == 560) && !followScale) return g_shadowQuality ? 1.0f : 0.5f;
+    static const uint32_t minPitch = getenv("BO3_SCALE_MIN_PITCH") ? uint32_t(atoi(getenv("BO3_SCALE_MIN_PITCH"))) : 256u;   // diagnostics
     uint32_t samplePitch = surfacePitch * (msaa == 2 ? 2u : 1u);
-    return samplePitch >= 256 ? g_scale : 1.0f;
+    return samplePitch >= minPitch ? g_scale : 1.0f;
 }
 
 // Host sample grid per guest pixel: EDRAM sample space (MSAA samples are separate host
@@ -217,7 +238,7 @@ static int TimingMode() { static const int m = getenv("BO3_GPU_TIMING") ? atoi(g
 void TimingMarkRaw(const char* label);
 void TimingMark(const char* label)
 {
-    if (TimingMode() == 2) return;   // per-pass mode: only EndPass / resolves mark
+    if (TimingMode() >= 2) return;   // per-pass / per-draw modes: only EndPass / resolves / draws mark
     TimingMarkRaw(label);
 }
 void TimingMarkRaw(const char* label)
@@ -239,7 +260,14 @@ void BeginFrame()
 {
     Frame& f = Cur();
     if (f.recording) return;
-    VK_CHECK(vkWaitForFences(g_vk.device, 1, &f.fence, VK_TRUE, UINT64_MAX));
+    // a GPU that never finishes (hang): say so in the log every 5 s instead of a silent black screen
+    for (int waited = 0;; waited += 5)
+    {
+        VkResult wr = vkWaitForFences(g_vk.device, 1, &f.fence, VK_TRUE, 5000000000ull);
+        if (wr == VK_SUCCESS) break;
+        if (wr != VK_TIMEOUT) VK_CHECK(wr);
+        LogError("renderer: the GPU has not finished a frame for %d s (GPU hang?)", waited + 5);
+    }
     VK_CHECK(vkResetCommandPool(g_vk.device, f.pool, 0));
     VK_CHECK(vkResetDescriptorPool(g_vk.device, f.descPool, 0));
     f.cmdIndex = 0;
@@ -249,6 +277,15 @@ void BeginFrame()
     f.uniformOffset = 0;
     f.indexOffset = 0;
     g_frameSerial++;
+    // framebuffers of destroyed render targets, once no frame in flight uses them (render pass fallback)
+    for (size_t i = 0; i < s_fbGraveyard.size();)
+        if (s_fbGraveyard[i].second + kFrames + 1 <= g_frameSerial)
+        {
+            vkDestroyFramebuffer(g_vk.device, s_fbGraveyard[i].first, nullptr);
+            s_fbGraveyard[i] = s_fbGraveyard.back();
+            s_fbGraveyard.pop_back();
+        }
+        else i++;
     static const bool timing = getenv("BO3_GPU_TIMING") != nullptr;
     if (timing)
     {
@@ -281,7 +318,7 @@ void BeginFrame()
                 for (auto& [k, e] : acc) v.push_back({ e.first, k });
                 std::sort(v.rbegin(), v.rend());
                 Log("gpu timing: %.2f ms/frame over 60 frames", accTotal / 60);
-                for (size_t k = 0; k < v.size() && k < 8; k++)
+                for (size_t k = 0; k < v.size() && k < (TimingMode() == 3 ? 25u : 8u); k++)
                     Log("  %7.2f ms/frame  %5.1f/frame  %s", v[k].first / 60, double(acc[v[k].second].second) / 60, v[k].second.c_str());
                 acc.clear();
                 accTotal = 0;
@@ -324,9 +361,10 @@ void BeginFrame()
 void EndPass()
 {
     if (!r.inPass) return;
-    vkCmdEndRendering(Cur().cmd);
+    if (g_vk.hasDynRendering) vkCmdEndRendering(Cur().cmd);
+    else vkCmdEndRenderPass(Cur().cmd);
     r.inPass = false;
-    if (TimingMode() == 2)
+    if (TimingMode() >= 2)
     {
         char label[96];
         snprintf(label, sizeof(label), "pass %ux%u m%u c%s d%s", r.passWidth, r.passHeight, r.passMsaa, r.passColor[0] ? "1" : "0", r.passDepth ? "1" : "0");
@@ -472,7 +510,9 @@ VkFormat ColorFormat(uint32_t f)
 uint32_t MaxRtRows()
 {
     static const uint32_t cap = getenv("BO3_RT_ROWS") ? uint32_t(atoi(getenv("BO3_RT_ROWS"))) : kRtHeight;   // diagnostics
-    return std::min<uint32_t>(uint32_t(R(float(cap) * g_scale)), 16384);
+    // (not below the unscaled height: surfaces under 256 samples stay at 1x whatever the scale - the
+    // colour-grading LUT is 1024 rows; capped at 2048 x scale it lost its bright rows below 0.5x)
+    return std::min<uint32_t>(uint32_t(R(float(cap) * std::max(g_scale, 1.0f))), 16384);
 }
 
 void EnsureRTHeight(HostRT& rt, uint32_t rows)
@@ -500,6 +540,7 @@ void EnsureRTHeight(HostRT& rt, uint32_t rows)
         rc.extent = { w, rt.img.height, 1 };
         vkCmdCopyImage(cmd, rt.img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rc);
         TextureCacheForgetImage(rt.img.image);
+        RendererForgetView(rt.img.view);
         TextureCacheDeferDestroy(rt.img);
         Log("renderer: %s RT base %u pitch %u grown to %u rows", rt.depth ? "depth" : "color", rt.base, rt.pitch, h);
     }
@@ -578,6 +619,8 @@ struct PipelineDesc
     VkFormat depth;
     uint32_t blend[4], writeMask[4];
     uint32_t discard;             // memexport-only draw: rasterizer discard, no attachments
+    // drivers without extended dynamic state: these are part of the pipeline (0 otherwise)
+    uint8_t sCull, sFront, sTopo, sDtest, sDwrite, sDcmp, sStest, sSop[4], sPad;
 };
 
 // Pipelines are compiled by background threads (~50 ms each when the driver's cache misses -
@@ -629,7 +672,16 @@ VkPipeline GetPipeline(const PipelineDesc& d)
     if (it == r.pipelines.end())
     {
         auto* e = r.pipelines.emplace(std::string(key), std::make_unique<R::PipeEntry>()).first->second.get();
-        VkShaderModule vsm = r.shaders[d.vs]->module, psm = r.shaders[d.ps]->module;
+        ShaderEntry& vse = *r.shaders[d.vs];
+        VkShaderModule vsm = vse.module, psm = r.shaders[d.ps]->module;
+        if (d.gs && !g_vk.hasGs)
+        {
+            vsm = d.gs == 1 ? vse.rectModule : vse.quadModule;   // (no geometry shaders: the VS variant)
+            static int warned = 0;
+            if (!vsm && warned++ < 5)
+                LogWarn("renderer: VS %016llx has no %s variant (%zu/%zu words, prim emu %d)", (unsigned long long)d.vs, d.gs == 1 ? "rect" : "quad",
+                        vse.t.spirvRect.size(), vse.t.spirvQuad.size(), int(ShaderTranslatorPrimEmu()));
+        }
         auto job = [e, d, vsm, psm] {
             VkPipeline p = BuildPipeline(d, vsm, psm);
             e->p.store(p);
@@ -661,29 +713,151 @@ VkPipeline GetPipeline(const PipelineDesc& d)
     return lastPipe;
 }
 
+// ---------------------------------------------------------------- render passes
+// Drivers without dynamic rendering (Vulkan 1.1 / 1.2: Adreno stock drivers of Android 11-13, older Mali):
+// one VkRenderPass per attachment format set (load / store everything, layouts unchanged) and one
+// framebuffer per image set. Framebuffers are destroyed a few frames after one of their images goes.
+std::mutex s_rpLock;
+std::map<std::string, VkRenderPass> s_renderPasses;
+VkRenderPass GetRenderPass(const VkFormat* color, uint32_t colorCount, VkFormat depth)
+{
+    std::string key((const char*)color, colorCount * sizeof(VkFormat));
+    key.append((const char*)&depth, sizeof(depth));
+    std::lock_guard lock(s_rpLock);
+    auto it = s_renderPasses.find(key);
+    if (it != s_renderPasses.end()) return it->second;
+    VkAttachmentDescription att[5] = {};
+    VkAttachmentReference cref[4], dref{};
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < colorCount; i++)
+    {
+        if (color[i] == VK_FORMAT_UNDEFINED) { cref[i] = { VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_UNDEFINED }; continue; }
+        att[n] = { 0, color[i], VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                   VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+        cref[i] = { n++, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    }
+    if (depth != VK_FORMAT_UNDEFINED)
+    {
+        att[n] = { 0, depth, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_LOAD,
+                   VK_ATTACHMENT_STORE_OP_STORE, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+        dref = { n++, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    }
+    VkSubpassDescription sp{};
+    sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sp.colorAttachmentCount = colorCount;
+    sp.pColorAttachments = colorCount ? cref : nullptr;
+    sp.pDepthStencilAttachment = depth != VK_FORMAT_UNDEFINED ? &dref : nullptr;
+    // (the work before / after: barriers outside the pass do the rest, like with dynamic rendering)
+    VkSubpassDependency dep[2] = {};
+    dep[0] = { VK_SUBPASS_EXTERNAL, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+               VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0 };
+    dep[1] = { 0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+               VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0 };
+    VkRenderPassCreateInfo ci{ VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+    ci.attachmentCount = n;
+    ci.pAttachments = att;
+    ci.subpassCount = 1;
+    ci.pSubpasses = &sp;
+    ci.dependencyCount = 2;
+    ci.pDependencies = dep;
+    VkRenderPass rp = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateRenderPass(g_vk.device, &ci, nullptr, &rp));
+    s_renderPasses[key] = rp;
+    return rp;
+}
+
+struct FbEntry { std::vector<VkImageView> views; uint32_t w, h; VkRenderPass rp; VkFramebuffer fb; };
+std::vector<FbEntry> s_framebuffers;
+std::vector<std::pair<VkFramebuffer, uint64_t>> s_fbGraveyard;   // (framebuffer, frame it was dropped)
+
+VkFramebuffer GetFramebuffer(VkRenderPass rp, const std::vector<VkImageView>& views, uint32_t w, uint32_t h)
+{
+    for (auto& e : s_framebuffers)
+        if (e.rp == rp && e.w == w && e.h == h && e.views == views) return e.fb;
+    VkFramebufferCreateInfo ci{ VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+    ci.renderPass = rp;
+    ci.attachmentCount = uint32_t(views.size());
+    ci.pAttachments = views.data();
+    ci.width = w;
+    ci.height = h;
+    ci.layers = 1;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateFramebuffer(g_vk.device, &ci, nullptr, &fb));
+    s_framebuffers.push_back({ views, w, h, rp, fb });
+    return fb;
+}
+
+// an image view about to be destroyed: its framebuffers go too (once the frames using them are done)
+void RendererForgetView(VkImageView v)
+{
+    if (g_vk.hasDynRendering || !v) return;
+    for (size_t i = 0; i < s_framebuffers.size();)
+    {
+        auto& e = s_framebuffers[i];
+        if (std::find(e.views.begin(), e.views.end(), v) != e.views.end())
+        {
+            s_fbGraveyard.push_back({ e.fb, g_frameSerial });
+            s_framebuffers[i] = s_framebuffers.back();
+            s_framebuffers.pop_back();
+        }
+        else i++;
+    }
+}
+
+// begins a pass on these attachments with the render pass of their formats (no dynamic rendering)
+void BeginRenderPassFallback(VkCommandBuffer cmd, HostRT* const* colors, uint32_t colorCount, HostRT* depth, uint32_t w, uint32_t h)
+{
+    VkFormat fmts[4] = {};
+    std::vector<VkImageView> views;
+    for (uint32_t i = 0; i < colorCount; i++)
+        if (colors[i]) { fmts[i] = colors[i]->img.format; views.push_back(colors[i]->img.view); }
+    if (depth) views.push_back(depth->img.view);
+    VkRenderPass rp = GetRenderPass(fmts, colorCount, depth ? depth->img.format : VK_FORMAT_UNDEFINED);
+    VkRenderPassBeginInfo bi{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    bi.renderPass = rp;
+    bi.framebuffer = GetFramebuffer(rp, views, w, h);
+    bi.renderArea = { { 0, 0 }, { w, h } };
+    vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+}
+
 VkPipeline BuildPipeline(const PipelineDesc& d, VkShaderModule vsm, VkShaderModule psm)
 {
     VkPipelineShaderStageCreateInfo st[3] = {};
     uint32_t nst = 0;
     st[nst++] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vsm, "main", nullptr };
-    if (d.gs) st[nst++] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_GEOMETRY_BIT, d.gs == 1 ? r.rectGs : r.quadGs, "main", nullptr };
+    if (!vsm) return VK_NULL_HANDLE;
+    if (d.gs && g_vk.hasGs) st[nst++] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_GEOMETRY_BIT, d.gs == 1 ? r.rectGs : r.quadGs, "main", nullptr };
     st[nst++] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, psm, "main", nullptr };
 
     VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
     VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-    ia.topology = VkPrimitiveTopology(d.topologyClass);
+    ia.topology = d.gs && !g_vk.hasGs ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VkPrimitiveTopology(g_vk.hasEds ? d.topologyClass : d.sTopo);
     VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
     vp.viewportCount = 1;
     vp.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
     rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.rasterizerDiscardEnable = d.discard ? VK_TRUE : VK_FALSE;
+    // (memexport-only draws: rasterizer discard - unless BO3_MEMEXPORT_NO_DISCARD, drivers that then skip
+    // the vertex shader's memory writes: no attachments, the fragments go nowhere)
+    static const bool noDiscard = getenv("BO3_MEMEXPORT_NO_DISCARD") != nullptr;
+    rs.rasterizerDiscardEnable = d.discard && !noDiscard ? VK_TRUE : VK_FALSE;
     rs.lineWidth = 1.0f;
     rs.depthClampEnable = VK_TRUE;
     rs.depthBiasEnable = VK_TRUE;   // values are dynamic (0 when the guest has polygon offset off)
     VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    if (!g_vk.hasEds)
+    {
+        rs.cullMode = d.sCull;
+        rs.frontFace = VkFrontFace(d.sFront);
+        ds.depthTestEnable = d.sDtest;
+        ds.depthWriteEnable = d.sDwrite;
+        ds.depthCompareOp = VkCompareOp(d.sDcmp);
+        ds.stencilTestEnable = d.sStest;
+        ds.front = { VkStencilOp(d.sSop[0]), VkStencilOp(d.sSop[1]), VkStencilOp(d.sSop[2]), VkCompareOp(d.sSop[3]), 0, 0, 0 };
+        ds.back = ds.front;
+    }
     VkPipelineColorBlendAttachmentState att[4] = {};
     for (uint32_t i = 0; i < d.colorCount; i++)
     {
@@ -710,16 +884,27 @@ VkPipeline BuildPipeline(const PipelineDesc& d, VkShaderModule vsm, VkShaderModu
                              VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
                              VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BIAS,
                              VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR /* last: only with VRS */ };
+    std::vector<VkDynamicState> dynList;
+    for (VkDynamicState x : dyn)
+    {
+        if (x == VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR && !g_vk.hasVrs) continue;
+        bool eds = x == VK_DYNAMIC_STATE_CULL_MODE || x == VK_DYNAMIC_STATE_FRONT_FACE || x == VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY ||
+                   x == VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE || x == VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE || x == VK_DYNAMIC_STATE_DEPTH_COMPARE_OP ||
+                   x == VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE || x == VK_DYNAMIC_STATE_STENCIL_OP;
+        if (eds && !g_vk.hasEds) continue;   // (static: in the pipeline)
+        dynList.push_back(x);
+    }
     VkPipelineDynamicStateCreateInfo dy{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dy.dynamicStateCount = uint32_t(std::size(dyn)) - (g_vk.hasVrs ? 0 : 1);
-    dy.pDynamicStates = dyn;
+    dy.dynamicStateCount = uint32_t(dynList.size());
+    dy.pDynamicStates = dynList.data();
     VkPipelineRenderingCreateInfo ri{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
     ri.colorAttachmentCount = d.colorCount;
     ri.pColorAttachmentFormats = d.color;
     ri.depthAttachmentFormat = d.depth;
     ri.stencilAttachmentFormat = d.depth;
 
-    VkGraphicsPipelineCreateInfo gp{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri };
+    VkGraphicsPipelineCreateInfo gp{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, g_vk.hasDynRendering ? &ri : nullptr };
+    if (!g_vk.hasDynRendering) gp.renderPass = GetRenderPass(d.color, d.colorCount, d.depth);
     gp.stageCount = nst;
     gp.pStages = st;
     gp.pVertexInputState = &vi;
@@ -834,10 +1019,13 @@ void ClearRect(HostRT& rt, const VkClearRect& rect, const VkClearValue& v)
     ri.layerCount = 1;
     if (rt.depth) { ri.pDepthAttachment = &a; ri.pStencilAttachment = &a; }
     else { ri.colorAttachmentCount = 1; ri.pColorAttachments = &a; }
-    vkCmdBeginRendering(cmd, &ri);
+    HostRT* one[1] = { &rt };
+    if (g_vk.hasDynRendering) vkCmdBeginRendering(cmd, &ri);
+    else BeginRenderPassFallback(cmd, rt.depth ? nullptr : one, rt.depth ? 0 : 1, rt.depth ? &rt : nullptr, rt.img.width, rt.img.height);
     VkClearAttachment ca{ rt.depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT), 0, v };
     vkCmdClearAttachments(cmd, 1, &ca, 1, &rect);
-    vkCmdEndRendering(cmd);
+    if (g_vk.hasDynRendering) vkCmdEndRendering(cmd);
+    else vkCmdEndRenderPass(cmd);
 }
 
 // ---------------------------------------------------------------- resolve
@@ -1033,7 +1221,7 @@ void MemoryBarrierAll(VkCommandBuffer cmd)
     VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     di.memoryBarrierCount = 1;
     di.pMemoryBarriers = &mb;
-    vkCmdPipelineBarrier2(cmd, &di);
+    VkCmdBarrier2(cmd, &di);
 }
 
 // Recorded GPU write to guest memory: the texture cache's write tracking learns it now (a check
@@ -1041,6 +1229,13 @@ void MemoryBarrierAll(VkCommandBuffer cmd)
 void GpuWroteGuest(uint32_t phys, uint32_t size)
 {
     WatchMarkDirty(phys, size);
+    if (g_vk.guestCopy)
+    {
+        // copy mode: the GPU writes its own copy; back into guest memory once that work is done
+        auto snap = WatchGpuWriteBegin(phys, size);
+        RendererDeferGuestWrite([phys, size, snap] { WatchGpuWriteDone(phys, size, snap, VkGuestCopyInvalidate); WatchMarkDirty(phys, size); });
+        return;
+    }
     RendererDeferGuestWrite([phys, size] { WatchMarkDirty(phys, size); });
 }
 
@@ -1078,7 +1273,10 @@ void ResolveToMemory(VkCommandBuffer cmd, HostRT& src, int x0, int y0, int x1, i
     MemoryBarrierAll(cmd);
     r.guestWritesRecorded = true;
     // (generous: tiled rows of 32, up to 16 bytes per pixel)
-    GpuWroteGuest(destBase, pc.info[1] * ((uint32_t(y1) + 31) & ~31u) * 16);
+    // (tiled rows of 32; 8 bytes per pixel for the 64-bit formats the resolve shader writes, else 4 - exact,
+    // copy mode copies this range back into guest memory)
+    const uint32_t dfmt = uint32_t(di.copy_dest_format), bpp = (dfmt == 26 || dfmt == 32 || dfmt == 37) ? 8u : 4u;
+    GpuWroteGuest(destBase, pc.info[1] * ((uint32_t(y1) + 31) & ~31u) * bpp);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.resolvePipe);
     g_computeDispatched = true;
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.resolveLayout, 0, 1, &set, 0, nullptr);
@@ -1193,9 +1391,56 @@ void Resolve()
             res.phys = destBase; res.width = dw; res.height = dh;
             Log("renderer: depth resolve target 0x%08X %ux%u", destBase, dw, dh);
         }
+        // EDRAM aliasing: another depth surface of the same pitch whose base lies inside this rect
+        // shares those tiles on the console (BO3's sun shadows: cascade 1 drawn at EDRAM base
+        // 1216 = row 1024 of the 1024x2048 atlas at base 384, then all resolved from 384). Its
+        // rows replace the ones this surface did not draw last; this surface's copy stops there.
+        struct Alias { HostRT* rt; int rowY, rows; };
+        std::vector<Alias> aliases;
+        static const bool noAlias = getenv("BO3_NO_DEPTH_ALIAS") != nullptr;
+        if (!noAlias)
+        {
+            const uint32_t msX = msaa >= 2 ? 2u : 1u, msY = msaa >= 1 ? 2u : 1u;
+            const uint32_t srcBase = Reg<reg::RB_DEPTH_INFO>().depth_base;
+            const uint32_t tilesPerRow = (pitch * msX + 79) / 80;
+            for (auto& [key, a] : r.rts)
+            {
+                if (!a.depth || &a == src || a.pitch != src->pitch || a.format != src->format || a.base <= srcBase || !a.lastSeq) continue;
+                uint32_t off = a.base - srcBase;
+                if (!tilesPerRow || off % tilesPerRow) continue;
+                int rowY = int(off / tilesPerRow * 16 / msY);   // guest pixel row of the alias's first row
+                // (only when it was drawn after this surface last reached those rows)
+                if (rowY >= y1 || a.lastSeq <= src->bandSeq[std::min(rowY / 256, 7)]) continue;
+                int rows = std::min<int>(y1 - rowY, int(float(a.img.height) / ssy));
+                if (rows > 0) aliases.push_back({ &a, rowY, rows });
+            }
+        }
         VkTransition(cmd, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkTransition(cmd, res.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        copyRect(cmd, *src, res.img, true);
+        {
+            int ownEnd = y1;
+            for (auto& al : aliases)
+                if (al.rowY + al.rows == y1) ownEnd = std::min(ownEnd, al.rowY);   // (the alias reaches the end: no need to copy below it)
+            int fullY1 = y1;
+            y1 = std::max(ownEnd, y0);
+            if (y1 > y0) copyRect(cmd, *src, res.img, true);
+            y1 = fullY1;
+        }
+        for (auto& al : aliases)
+        {
+            HostRT& a = *al.rt;
+            VkTransition(cmd, a.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkImageBlit bl{};
+            bl.srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+            bl.dstSubresource = bl.srcSubresource;
+            bl.srcOffsets[0] = { R(x0 * ssx), 0, 0 };
+            bl.srcOffsets[1] = { R(x1 * ssx), std::min<int>(R(al.rows * ssy), int(a.img.height)), 1 };
+            bl.dstOffsets[0] = { R(x0 * S), R(al.rowY * S), 0 };
+            bl.dstOffsets[1] = { R(x1 * S), std::min<int>(R((al.rowY + al.rows) * S), int(res.img.height)), 1 };
+            vkCmdBlitImage(cmd, a.img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, res.img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
+            static int logged = 0;
+            if (logged++ < 4) Log("renderer: depth resolve 0x%08X: rows %d.. from the aliased surface at EDRAM base %u", destBase, al.rowY, a.base);
+        }
         VkTransition(cmd, res.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         {
             char tag[64];
@@ -1205,7 +1450,7 @@ void Resolve()
         res.scale = S;
         TextureCacheRegisterDepthResolve(destBase, &res.img, S);
         TimingMark("resolve depth copy");
-        if (TimingMode() == 2) TimingMarkRaw("resolve depth");
+        if (TimingMode() >= 2) TimingMarkRaw("resolve depth");
     }
     if (copy.copy_command != xenos::CopyCommand::kNull && destBase && !depthSrc)
     {
@@ -1239,7 +1484,7 @@ void Resolve()
         res.scale = S;
         TextureCacheRegisterResolve(destBase, &res.img, uint32_t(res.width), uint32_t(res.height), Reg<reg::RB_COPY_DEST_INFO>().copy_dest_swap, S);
         TimingMark("resolve copy");
-        if (TimingMode() == 2) TimingMarkRaw("resolve color");
+        if (TimingMode() >= 2) TimingMarkRaw("resolve color");
     }
     VkClearRect cr{ { { R(x0 * ssx), R(y0 * ssy) }, { uint32_t(R(x1 * ssx) - R(x0 * ssx)), uint32_t(R(y1 * ssy) - R(y0 * ssy)) } }, 0, 1 };
     auto clampRect = [&](HostRT& rt) {
@@ -1310,13 +1555,17 @@ void RendererInit()
     }
     CreatePresentSemaphores();
     CreateLayouts();
-    r.rectGs = CompileGs(kRectGs);
-    r.quadGs = CompileGs(kQuadGs);
+    if (g_vk.hasGs)
+    {
+        r.rectGs = CompileGs(kRectGs);
+        r.quadGs = CompileGs(kQuadGs);
+    }
+    ShaderTranslatorSetPrimEmu(!g_vk.hasGs);
     CreateResolvePipeline();
     std::thread(CompletionThread).detach();
     std::thread(SubmitThread).detach();
     ShaderCacheInit();
-    if (const char* e = getenv("BO3_RENDER_SCALE")) g_scale = float(std::lround(std::clamp(float(atof(e)), 0.5f, 4.0f) * 6)) / 6.0f;
+    if (const char* e = getenv("BO3_RENDER_SCALE")) g_scale = float(std::lround(std::clamp(float(atof(e)), 0.25f, 4.0f) * 60)) / 60.0f;
     Log("renderer: internal scale x%g", g_scale);
     for (int i = 0; i < 4; i++) std::thread(ShaderWorker).detach();
     TextureCacheInit(r.setLayout1);
@@ -1340,6 +1589,9 @@ struct ShaderCacheHeader
     uint32_t colorExports, writesDepth, kills, memexports, spirvWords;
     uint8_t memexportConsts[4], memexportConstCount, pad[3];
     uint64_t constChunks, fetchVec4;
+    uint32_t rectWords, quadWords;   // VS variants without geometry shaders (after the main SPIR-V)
+    uint8_t vfFlags[96];
+    uint16_t vfStride[96], vfMinOff[96], vfMaxEnd[96];
 };
 
 std::string ShaderCachePath(uint64_t h)
@@ -1380,6 +1632,15 @@ bool ShaderCacheLoad(uint64_t h, TranslatedShader& t)
         t.colorExports = hd.colorExports; t.writesDepth = hd.writesDepth; t.kills = hd.kills; t.memexports = hd.memexports;
         memcpy(t.memexportConsts, hd.memexportConsts, 4); t.memexportConstCount = hd.memexportConstCount;
         t.constChunks = hd.constChunks; t.fetchVec4 = hd.fetchVec4;
+        memcpy(t.vfFlags, hd.vfFlags, sizeof(hd.vfFlags)); memcpy(t.vfStride, hd.vfStride, sizeof(hd.vfStride));
+        memcpy(t.vfMinOff, hd.vfMinOff, sizeof(hd.vfMinOff)); memcpy(t.vfMaxEnd, hd.vfMaxEnd, sizeof(hd.vfMaxEnd));
+        if (ok && hd.rectWords < (16u << 20) && hd.quadWords < (16u << 20))
+        {
+            t.spirvRect.resize(hd.rectWords);
+            t.spirvQuad.resize(hd.quadWords);
+            ok = fread(t.spirvRect.data(), 4, hd.rectWords, f) == hd.rectWords && fread(t.spirvQuad.data(), 4, hd.quadWords, f) == hd.quadWords;
+        }
+        if (ok && !t.pixel && ShaderTranslatorPrimEmu() && (t.spirvRect.empty() || t.spirvQuad.empty())) ok = false;   // (translate again)
     }
     fclose(f);
     return ok;
@@ -1394,10 +1655,15 @@ void ShaderCacheStore(uint64_t h, const TranslatedShader& t)
     memcpy(hd.memexportConsts, t.memexportConsts, 4); hd.memexportConstCount = t.memexportConstCount;
     hd.constChunks = t.constChunks; hd.fetchVec4 = t.fetchVec4;
     hd.spirvWords = uint32_t(t.spirv.size());
+    hd.rectWords = uint32_t(t.spirvRect.size());
+    memcpy(hd.vfFlags, t.vfFlags, sizeof(hd.vfFlags)); memcpy(hd.vfStride, t.vfStride, sizeof(hd.vfStride));
+    memcpy(hd.vfMinOff, t.vfMinOff, sizeof(hd.vfMinOff)); memcpy(hd.vfMaxEnd, t.vfMaxEnd, sizeof(hd.vfMaxEnd));
+    hd.quadWords = uint32_t(t.spirvQuad.size());
     std::string path = ShaderCachePath(h), tmp = path + ".tmp";
     FILE* f = fopen(tmp.c_str(), "wb");
     if (!f) return;
-    bool ok = fwrite(&hd, sizeof(hd), 1, f) == 1 && fwrite(t.spirv.data(), 4, t.spirv.size(), f) == t.spirv.size();
+    bool ok = fwrite(&hd, sizeof(hd), 1, f) == 1 && fwrite(t.spirv.data(), 4, t.spirv.size(), f) == t.spirv.size() &&
+              fwrite(t.spirvRect.data(), 4, t.spirvRect.size(), f) == t.spirvRect.size() && fwrite(t.spirvQuad.data(), 4, t.spirvQuad.size(), f) == t.spirvQuad.size();
     fclose(f);
     if (ok) std::rename(tmp.c_str(), path.c_str()); else std::remove(tmp.c_str());
 }
@@ -1417,6 +1683,8 @@ void BuildShader(uint64_t h, uint32_t type, ShaderEntry& e, std::vector<uint32_t
     e.t.glsl.clear();
     e.t.glsl.shrink_to_fit();
     e.module = MakeModule(e.t.spirv);
+    if (!e.t.spirvRect.empty()) e.rectModule = MakeModule(e.t.spirvRect);
+    if (!e.t.spirvQuad.empty()) e.quadModule = MakeModule(e.t.spirvQuad);
     e.state.store(1, std::memory_order_release);
     static std::atomic<uint64_t> totalUs{ 0 };
     totalUs += uint64_t(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
@@ -1507,6 +1775,8 @@ void RendererShaderSet(uint32_t type, uint64_t h, std::vector<uint32_t> code)
     if (!noCache && ShaderCacheLoad(h, e->t))
     {
         e->module = MakeModule(e->t.spirv);
+        if (!e->t.spirvRect.empty()) e->rectModule = MakeModule(e->t.spirvRect);
+        if (!e->t.spirvQuad.empty()) e->quadModule = MakeModule(e->t.spirvQuad);
         e->state.store(1, std::memory_order_release);
         return;
     }
@@ -1518,6 +1788,74 @@ void RendererShaderSet(uint32_t type, uint64_t h, std::vector<uint32_t> code)
         s_jobs.push_back({ h, type, e, std::move(code) });
     }
     s_jobCv.notify_one();
+}
+
+// A clear quad as vkCmdClearAttachments (see RendererDraw); false = draw it normally.
+static bool FastClear(VkCommandBuffer cmd, HostRT* const colors[4], HostRT* depth, const PipelineDesc& pd, reg::RB_DEPTHCONTROL dc,
+                      float wx, float wy, float ssx, float ssy, const VkRect2D& sc)
+{
+    // vertices: fetch constant 0, 7 floats each (x, y, z window space; r, g, b, a)
+    uint32_t d0 = GpuReg(0x4800), d1 = GpuReg(0x4801);
+    if ((d0 & 3u) != 3u) return false;   // (type: vertex)
+    uint32_t addr = 0xA0000000u | ((d0 & ~3u) & 0x1FFFFFFFu), endian = d1 & 3u;
+    float v[3][7];
+    for (int i = 0; i < 21; i++)
+    {
+        uint32_t w;
+        memcpy(&w, g_base + addr + i * 4, 4);
+        switch (endian) { case 1: w = ((w & 0x00FF00FFu) << 8) | ((w & 0xFF00FF00u) >> 8); break; case 2: w = __builtin_bswap32(w); break; case 3: w = (w << 16) | (w >> 16); break; }
+        memcpy(&v[i / 7][i % 7], &w, 4);
+    }
+    for (int i = 1; i < 3; i++)
+        for (int k = 2; k < 7; k++)
+            if (v[i][k] != v[0][k]) return false;   // not one colour / depth
+    float x0 = std::min({ v[0][0], v[1][0], v[2][0] }), x1 = std::max({ v[0][0], v[1][0], v[2][0] });
+    float y0 = std::min({ v[0][1], v[1][1], v[2][1] }), y1 = std::max({ v[0][1], v[1][1], v[2][1] });
+    if (!(x1 > x0 && y1 > y0)) return false;
+    VkClearAttachment att[5];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < pd.colorCount; i++)
+    {
+        if (!colors[i]) continue;
+        if (pd.writeMask[i] != 0xF || pd.blend[i] != 0x00010001u) return false;
+        auto f = xenos::ColorRenderTargetFormat(colors[i]->format);
+        if (f == xenos::ColorRenderTargetFormat::k_16_16 || f == xenos::ColorRenderTargetFormat::k_16_16_16_16) return false;   // (range scaling)
+        VkClearAttachment& a = att[n++];
+        a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        a.colorAttachment = i;
+        for (int k = 0; k < 4; k++) a.clearValue.color.float32[k] = v[0][3 + k];
+    }
+    static const int depthMode = getenv("BO3_FAST_CLEAR_DEPTH") ? atoi(getenv("BO3_FAST_CLEAR_DEPTH")) : 0;   // (tests)
+    if (depth && depthMode == 0 && (dc.z_enable || dc.stencil_enable)) return false;   // depth: drawn (partial depth clears left lost tiles on RADV)
+    if (depth)
+    {
+        VkImageAspectFlags aspect = 0;
+        VkClearAttachment a{};
+        if (dc.z_enable && dc.z_write_enable)
+        {
+            if (uint32_t(dc.zfunc) != 7) return false;   // (ALWAYS)
+            aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            a.clearValue.depthStencil.depth = std::clamp(v[0][2], 0.0f, 1.0f);
+        }
+        else if (dc.z_enable && uint32_t(dc.zfunc) != 7) return false;   // (a depth test that could reject pixels)
+        if (dc.stencil_enable)
+        {
+            auto srm = Reg<reg::RB_STENCILREFMASK>();
+            // only "always pass, replace": the stencil becomes the reference
+            if (dc.backface_enable || uint32_t(dc.stencilfunc) != 7 || uint32_t(dc.stencilzpass) != 2 || srm.stencilwritemask != 0xFF) return false;
+            aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            a.clearValue.depthStencil.stencil = srm.stencilref;
+        }
+        if (depthMode == 2 && aspect == VK_IMAGE_ASPECT_DEPTH_BIT) { aspect |= VK_IMAGE_ASPECT_STENCIL_BIT; a.clearValue.depthStencil.stencil = 0; }   // (test)
+        if (aspect) { a.aspectMask = aspect; att[n++] = a; }
+    }
+    if (!n) return false;
+    int hx0 = std::max(R((x0 + wx) * ssx), sc.offset.x), hy0 = std::max(R((y0 + wy) * ssy), sc.offset.y);
+    int hx1 = std::min(R((x1 + wx) * ssx), sc.offset.x + int(sc.extent.width)), hy1 = std::min(R((y1 + wy) * ssy), sc.offset.y + int(sc.extent.height));
+    if (hx1 <= hx0 || hy1 <= hy0) return true;   // nothing visible
+    VkClearRect rect{ { { hx0, hy0 }, { uint32_t(hx1 - hx0), uint32_t(hy1 - hy0) } }, 0, 1 };
+    vkCmdClearAttachments(cmd, n, att, 1, &rect);
+    return true;
 }
 
 void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bool indexed)
@@ -1608,6 +1946,12 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
     {
         auto dinfo = Reg<reg::RB_DEPTH_INFO>();
         depth = &GetRT(dinfo.depth_base, pitch, uint32_t(dinfo.depth_format), true, needRows);
+        {
+            uint64_t seq = ++r.drawSeq;
+            depth->lastSeq = seq;
+            for (uint32_t b = 0; b < 8; b++)
+                if (needRows > uint32_t(R(b * 256 * ssy)) + 1) depth->bandSeq[b] = seq;
+        }
         pd.depth = depth->img.format;
     }
     static const bool noMemexport = getenv("BO3_NO_MEMEXPORT") != nullptr;   // diagnostics
@@ -1620,7 +1964,35 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
                     uint32_t(mode), colorMask, ps->t.colorExports, depthCtl.value, GpuReg(XE_GPU_REG_RB_COLOR_INFO), uint32_t(di.prim_type), count);
         return;
     }
+    if (!g_vk.hasEds)
+    {
+        // (the same values the dynamic state calls below would set)
+        auto sm = Reg<reg::PA_SU_SC_MODE_CNTL>();
+        uint32_t cullv = (sm.cull_front ? VK_CULL_MODE_FRONT_BIT : 0) | (sm.cull_back ? VK_CULL_MODE_BACK_BIT : 0);
+        pd.sCull = uint8_t(gs ? VK_CULL_MODE_NONE : cullv);
+        pd.sFront = uint8_t(sm.face ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+        pd.sTopo = uint8_t(topo);
+        pd.sDtest = depth && depthCtl.z_enable;
+        pd.sDwrite = depth && depthCtl.z_enable && depthCtl.z_write_enable;
+        pd.sDcmp = uint8_t(depthCtl.zfunc);
+        pd.sStest = depth && depthCtl.stencil_enable;
+        pd.sSop[0] = uint8_t(depthCtl.stencilfail); pd.sSop[1] = uint8_t(depthCtl.stencilzpass);
+        pd.sSop[2] = uint8_t(depthCtl.stencilzfail); pd.sSop[3] = uint8_t(depthCtl.stencilfunc);
+    }
     VkPipeline pipe = GetPipeline(pd);
+    if (!pipe && (vs->t.memexports || ps->t.memexports))
+    {
+        // a draw that writes memory (memexport: BO3's video decoding, skinning) is never skipped -
+        // its results feed later frames (a skipped one corrupts the video until its next key frame)
+        auto t0 = std::chrono::steady_clock::now();
+        while (!pipe && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
+        {
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            pipe = GetPipeline(pd);
+            auto it = r.pipelines.find(std::string_view((const char*)&pd, sizeof(pd)));
+            if (it != r.pipelines.end() && it->second->state.load() == 2) break;   // (failed)
+        }
+    }
     if (!pipe) { r.skip[6]++; return; }
 
     Frame& f = Cur();
@@ -1634,7 +2006,12 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
     VkImage wantColor[4] = {};
     for (uint32_t i = 0; i < 4; i++) wantColor[i] = colors[i] ? colors[i]->img.image : VK_NULL_HANDLE;
     VkImage wantDepth = depth ? depth->img.image : VK_NULL_HANDLE;
-    if (!r.inPass || !FastEq(wantColor, r.passColor, sizeof(wantColor)) || wantDepth != r.passDepth)
+    // the pass covers the rows its draws use (not the whole 2048-row surface: tilers load and store all of
+    // the render area each pass); a draw reaching further starts a taller one
+    static const bool fullArea = getenv("BO3_FULL_PASS_AREA") != nullptr;
+    const bool hasTargets = pd.colorCount || depth;
+    if (!r.inPass || !FastEq(wantColor, r.passColor, sizeof(wantColor)) || wantDepth != r.passDepth ||
+        (hasTargets && !fullArea && needRows > r.passHeight))
     {
         EndPass();
         VkRenderingAttachmentInfo ca[4] = {};
@@ -1664,13 +2041,16 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
         }
         VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
         if (w == UINT32_MAX) { w = std::max(pitch, 1u); h = uint32_t(R(kRtHeight * g_scale)); }   // no attachments (memexport)
+        else if (!fullArea) h = std::min(h, std::max<uint32_t>((needRows + 63) & ~63u, 64));
         ri.renderArea = { { 0, 0 }, { w, h } };
         ri.layerCount = 1;
         ri.colorAttachmentCount = pd.colorCount;
         ri.pColorAttachments = ca;
         ri.pDepthAttachment = depth ? &da : nullptr;
         ri.pStencilAttachment = depth ? &da : nullptr;
-        vkCmdBeginRendering(cmd, &ri);
+        if (TimingMode() >= 2) TimingMarkRaw("between passes (copies, waits for the CPU)");
+        if (g_vk.hasDynRendering) vkCmdBeginRendering(cmd, &ri);
+        else BeginRenderPassFallback(cmd, colors, pd.colorCount, depth, w, h);
         r.passCount++;
         r.inPass = true;
         memcpy(r.passColor, wantColor, sizeof(wantColor));
@@ -1778,7 +2158,7 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
     pdc.psInfo[0] = prog.param_gen ? misc.param_gen_pos : 0xFF;
     pdc.psInfo[1] = cc.alpha_test_enable ? (8u | uint32_t(cc.alpha_func)) : 0u;
     pdc.psInfo[2] = GpuReg(XE_GPU_REG_RB_ALPHA_REF);
-    pdc.psInfo[3] = msx | (msy << 4) | (uint32_t(R(surfScale * 6)) << 8);   // (scale x 6 in bits 8..15)   // MSAA sample grid + resolution scale (param_gen position is in guest pixels)
+    pdc.psInfo[3] = msx | (msy << 4) | (uint32_t(R(surfScale * 60)) << 8);   // (scale x 60 in bits 8..15)   // MSAA sample grid + resolution scale (param_gen position is in guest pixels)
     memcpy(vdc.psInfo, pdc.psInfo, 16);
     memcpy(pdc.drawInfo, vdc.drawInfo, 16);
     // Constant blocks: refresh only the 16-register chunks the CP changed (all of them when a
@@ -1910,19 +2290,19 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
     VkCullModeFlags cull = (scMode.cull_front ? VK_CULL_MODE_FRONT_BIT : 0) | (scMode.cull_back ? VK_CULL_MODE_BACK_BIT : 0);
     if (gs) cull = VK_CULL_MODE_NONE;
     cur.cull = cull;
-    if (cur.cull != last.cull) r.stateChanges[7]++, vkCmdSetCullMode(cmd, cull);
+    if (cur.cull != last.cull && g_vk.hasEds) r.stateChanges[7]++, vkCmdSetCullMode(cmd, cull);
     cur.front = scMode.face ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    if (cur.front != last.front) r.stateChanges[8]++, vkCmdSetFrontFace(cmd, VkFrontFace(cur.front));
+    if (cur.front != last.front && g_vk.hasEds) r.stateChanges[8]++, vkCmdSetFrontFace(cmd, VkFrontFace(cur.front));
     cur.topo = topo;
-    if (cur.topo != last.topo) r.stateChanges[9]++, vkCmdSetPrimitiveTopology(cmd, topo);
+    if (cur.topo != last.topo && g_vk.hasEds) r.stateChanges[9]++, vkCmdSetPrimitiveTopology(cmd, topo);
     cur.dtest = depth && depthCtl.z_enable;
-    if (cur.dtest != last.dtest) r.stateChanges[10]++, vkCmdSetDepthTestEnable(cmd, cur.dtest);
+    if (cur.dtest != last.dtest && g_vk.hasEds) r.stateChanges[10]++, vkCmdSetDepthTestEnable(cmd, cur.dtest);
     cur.dwrite = depth && depthCtl.z_enable && depthCtl.z_write_enable;
-    if (cur.dwrite != last.dwrite) r.stateChanges[11]++, vkCmdSetDepthWriteEnable(cmd, cur.dwrite);
+    if (cur.dwrite != last.dwrite && g_vk.hasEds) r.stateChanges[11]++, vkCmdSetDepthWriteEnable(cmd, cur.dwrite);
     cur.dcmp = uint32_t(depthCtl.zfunc);
-    if (cur.dcmp != last.dcmp) r.stateChanges[12]++, vkCmdSetDepthCompareOp(cmd, VkCompareOp(cur.dcmp));
+    if (cur.dcmp != last.dcmp && g_vk.hasEds) r.stateChanges[12]++, vkCmdSetDepthCompareOp(cmd, VkCompareOp(cur.dcmp));
     cur.stest = depth && depthCtl.stencil_enable;
-    if (cur.stest != last.stest) r.stateChanges[13]++, vkCmdSetStencilTestEnable(cmd, cur.stest);
+    if (cur.stest != last.stest && g_vk.hasEds) r.stateChanges[13]++, vkCmdSetStencilTestEnable(cmd, cur.stest);
     {
         // Polygon offset (shadow maps): Xenos constant offset is a depth fraction (host D24:
         // x 2^24), the slope scale is in 1/16 subpixel units (Xenia's conversion).
@@ -1936,7 +2316,7 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
     auto srm = Reg<reg::RB_STENCILREFMASK>();
     cur.sop[0] = uint32_t(depthCtl.stencilfail); cur.sop[1] = uint32_t(depthCtl.stencilzpass);
     cur.sop[2] = uint32_t(depthCtl.stencilzfail); cur.sop[3] = uint32_t(depthCtl.stencilfunc);
-    if (memcmp(cur.sop, last.sop, sizeof(cur.sop)))
+    if (memcmp(cur.sop, last.sop, sizeof(cur.sop)) && g_vk.hasEds)
         r.stateChanges[15]++, vkCmdSetStencilOp(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, VkStencilOp(cur.sop[0]), VkStencilOp(cur.sop[1]), VkStencilOp(cur.sop[2]), VkCompareOp(cur.sop[3]));
     cur.smask = srm.stencilmask; cur.swmask = srm.stencilwritemask; cur.sref = srm.stencilref;
     if (cur.smask != last.smask) r.stateChanges[16]++, vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, cur.smask);
@@ -1955,7 +2335,76 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
         }
     }
     last = cur;
-    if (hostFirstIndex >= 0)
+    if (WatchNeedsRequests())
+    {
+        // copy mode: what this draw reads from guest memory goes up first - its indices and, per vertex
+        // fetch constant (type 3: address, size in dwords), the vertices it reads: the index range x the
+        // shader's stride (the constants often span a whole heap of tens of MB). Fetches indexed by other
+        // data (bone matrices) take the constant's whole range. GPUs that do not snoop the CPU caches:
+        // the same ranges are cleaned from the CPU caches instead (only granules the CPU wrote, either way).
+        uint32_t minIdx = 0, maxIdx = count ? count - 1 : 0;
+        bool rangeKnown = !indexed;
+        const uint32_t idxOffset = GpuReg(XE_GPU_REG_VGT_INDX_OFFSET);
+        const uint32_t ib = indexBase & 0x1FFFFFFFu;
+        if (indexed) WatchRequestUpload(ib, count * (idx32 ? 4u : 2u));
+        // (indices as the vertex shader's fetchIndex reads them: 32-bit words in the index endian mode;
+        // scanned only when a fetch constant's memory has CPU writes to send)
+        auto scanIndices = [&] {
+            rangeKnown = true;
+            const uint32_t en = indexSize >> 30;
+            auto swapE = [en](uint32_t v) {
+                if (en == 1) return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+                if (en == 2) return __builtin_bswap32(v);
+                if (en == 3) return (v << 16) | (v >> 16);
+                return v;
+            };
+            const uint8_t* mem = g_base + 0xA0000000ull;
+            minIdx = UINT32_MAX; maxIdx = 0;
+            for (uint32_t i = 0; i < count; i++)
+            {
+                uint32_t byteAddr = ib + i * (idx32 ? 4u : 2u), w;
+                memcpy(&w, mem + ((byteAddr & ~3u) & 0x1FFFFFFFu), 4);
+                w = swapE(w);
+                uint32_t v = idx32 ? w : ((byteAddr & 2u) ? (w >> 16) : (w & 0xFFFFu));
+                if (v == (idx32 ? 0xFFFFFFFFu : 0xFFFFu)) continue;   // (primitive reset)
+                minIdx = std::min(minIdx, v); maxIdx = std::max(maxIdx, v);
+            }
+            if (minIdx > maxIdx) minIdx = maxIdx = 0;
+        };
+        auto upFetch = [&](const TranslatedShader& t) {
+            for (uint32_t p = 0; p < 96; p++)
+            {
+                if (!(t.vfFlags[p] & 1)) continue;
+                uint32_t d0 = GpuReg(0x4800 + 2 * p), d1 = GpuReg(0x4800 + 2 * p + 1);
+                if ((d0 & 3u) != 3u) continue;
+                uint32_t base = (d0 & ~3u) & 0x1FFFFFFFu, size = ((d1 >> 2) & 0xFFFFFFu) * 4;
+                if (!WatchAnyDirty(base, size)) continue;   // (static geometry: nothing to send)
+                if (!(t.vfFlags[p] & 2))
+                {
+                    if (!rangeKnown) scanIndices();
+                    uint64_t lo = (uint64_t(minIdx + idxOffset) * t.vfStride[p] + t.vfMinOff[p]) * 4;
+                    uint64_t hi = (uint64_t(maxIdx + idxOffset) * t.vfStride[p] + t.vfMaxEnd[p]) * 4;
+                    if (lo >= size) continue;
+                    hi = std::min<uint64_t>(hi, size);
+                    WatchRequestUpload(base + uint32_t(lo), uint32_t(hi - lo));
+                }
+                else WatchRequestUpload(base, size);
+            }
+        };
+        upFetch(vs->t);
+        upFetch(ps->t);
+    }
+    // BO3's clear quads (D3D's Clear: one rect list of 3 window-space vertices, position + colour,
+    // depth ALWAYS) become vkCmdClearAttachments - a fast clear (HTILE / DCC on AMD) instead of
+    // shading every pixel: 9 per frame, ~0.75 ms on the 680M (the 1040x2048 shadow atlas, the scene).
+    bool fastCleared = false;
+    static const bool noFastClear = getenv("BO3_NO_FAST_CLEAR") != nullptr;
+    if (!noFastClear && r.curVS == 0x3ab766e338a19a76ull && r.curPS == 0x50c7e9595fc160b9ull && !indexed && count == 3 &&
+        di.prim_type == xenos::PrimitiveType::kRectangleList && vte.value == 0x300 && !Reg<reg::RB_COLORCONTROL>().alpha_test_enable &&
+        cur.bias[0] == 0 && cur.bias[1] == 0)
+        fastCleared = FastClear(cmd, colors, depth, pd, depthCtl, wx, wy, ssx, ssy, cur.sc);
+    if (fastCleared) {}
+    else if (hostFirstIndex >= 0)
     {
         VkIndexType it = idx32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
         if (g_idxBound != int(it))
@@ -1966,7 +2415,18 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
         vkCmdDrawIndexed(cmd, count, 1, uint32_t(hostFirstIndex), int32_t(GpuReg(XE_GPU_REG_VGT_INDX_OFFSET)), 0);
     }
     else
-        vkCmdDraw(cmd, count, 1, 0, indexed ? (indexBase & 0x1FFFFFFF) : 0);
+    {
+        // no geometry shaders: 6 host vertices per rectangle (3 guest) / quad (4 guest)
+        uint32_t hostCount = !gs || g_vk.hasGs ? count : gs == 1 ? count / 3 * 6 : count / 4 * 6;
+        vkCmdDraw(cmd, hostCount, 1, 0, indexed ? (indexBase & 0x1FFFFFFF) : 0);
+    }
+    if (TimingMode() == 3)
+    {
+        // per draw (rough: pipelined), by pixel shader and target size
+        char label[96];
+        snprintf(label, sizeof(label), "ps %016llx %ux%u", (unsigned long long)r.curPS, r.passWidth, r.passHeight);
+        TimingMarkRaw(label);
+    }
     if (vs->t.memexports || ps->t.memexports)
     {
         // The texture cache's write tracking only sees CPU stores: report the exported range
@@ -2119,6 +2579,169 @@ void UpdateOverlay() { UpdateOverlayNow(); }
 void RendererSetOverlay(int mode) { g_overlayMode = std::clamp(mode, 0, 2); }
 int RendererOverlay() { return g_overlayMode.load(); }
 
+// presentation (RendererSwap): the swapchain is used by the command processor (acquire) and the
+// submit thread (present) - one at a time
+std::mutex s_swapLock;
+std::atomic<bool> s_presentStale{ false };   // the last present wants a new swapchain
+std::atomic<uint64_t> s_presentUs{ 0 };     // time in vkQueuePresentKHR on the submit thread
+
+// after each frame is handed over: scale / shadow changes, frame logs, statistics
+static void AfterPresent()
+{
+    if (static const char* sw = getenv("BO3_SCALE_SWITCH"); sw)   // diagnostics: "<frame>:<scale>"
+        if (r.swapCount == strtoull(sw, nullptr, 10) && strchr(sw, ':')) g_pendingScale = uint32_t(R(float(atof(strchr(sw, ':') + 1)) * 60));
+    // diagnostics: BO3_SCALE_FILE=<path> - writing a scale (e.g. 0.35) to it switches to it (the file is then deleted)
+    if (static const char* sf = getenv("BO3_SCALE_FILE"); sf && r.swapCount % 15 == 0)
+        if (FILE* f = fopen(sf, "r"))
+        {
+            float v = 0;
+            if (fscanf(f, "%f", &v) == 1 && v > 0) g_pendingScale = uint32_t(R(std::clamp(v, 0.25f, 4.0f) * 60));
+            fclose(f);
+            remove(sf);
+        }
+    uint32_t ps6 = g_pendingScale.exchange(0);
+    int psq = g_pendingShadows.exchange(-1);
+    bool scaleChange = ps6 && std::fabs(float(ps6) / 60.0f - g_scale) > 0.01f, shadowChange = psq >= 0 && psq != g_shadowQuality;
+    if (scaleChange || shadowChange)
+    {
+        // New internal resolution: drop every EDRAM render target and resolve image (their
+        // contents are rebuilt by the next frames).
+        QueueSync();
+        vkDeviceWaitIdle(g_vk.device);
+        TextureCacheClearResolves();
+        for (auto& [k, rt] : r.rts) { TextureCacheForgetImage(rt.img.image); RendererForgetView(rt.img.view); VkDestroyImage(rt.img); }
+        for (auto& [k, res] : r.resolved) { TextureCacheForgetImage(res.img.image); VkDestroyImage(res.img); }
+        for (auto& [k, res] : r.resolvedDepth) { TextureCacheForgetImage(res.img.image); VkDestroyImage(res.img); }
+        r.rts.clear();
+        for (auto& m : r.rtMemo) m = {};
+        r.resolved.clear();
+        r.resolvedDepth.clear();
+        r.inPass = false;
+        if (scaleChange)
+        {
+            float ps = float(ps6) / 60.0f;
+            Log("renderer: internal resolution x%g -> x%g", g_scale, ps);
+            g_scale = ps;
+        }
+        if (shadowChange) { Log("renderer: shadow quality %d -> %d", g_shadowQuality, psq); g_shadowQuality = psq; }
+    }
+    {
+        static const uint64_t logFrame = getenv("BO3_FRAME_LOG") ? strtoull(getenv("BO3_FRAME_LOG"), nullptr, 10) : 0;
+        if (g_frameLog) Log("frame: ===== end of frame %llu =====", (unsigned long long)r.swapCount - 1);
+        g_frameLog = logFrame && r.swapCount == logFrame;
+        // BO3_FRAME_LOG_FILE=path: log (and dump) the next frame whenever that file appears (it is removed)
+        static const char* logFile = getenv("BO3_FRAME_LOG_FILE");
+        if (logFile && (r.swapCount & 15) == 0 && access(logFile, F_OK) == 0) { unlink(logFile); g_frameLog = true; }
+        if (g_frameLog) Log("frame: ===== frame %llu =====", (unsigned long long)r.swapCount);
+    }
+    static auto last = std::chrono::steady_clock::now();
+    static auto lastSwap = std::chrono::steady_clock::now();
+    {
+        auto now = std::chrono::steady_clock::now();
+        double frameMs = std::chrono::duration<double, std::milli>(now - lastSwap).count();
+        r.worstFrameMs = std::max(r.worstFrameMs, frameMs);
+        // BO3_SPIKE_LOG=<ms>: every frame longer than that, with what happened in it
+        static const double spikeMs = getenv("BO3_SPIKE_LOG") ? atof(getenv("BO3_SPIKE_LOG")) : 0;
+        if (spikeMs > 0)
+        {
+            extern uint32_t g_tcNew[8];
+            extern double g_cpIdleTotalMs;
+            uint64_t TextureCacheUploadedSoFar();
+            static uint32_t prevNew[8];
+            static uint64_t prevDraws = 0, prevUp = 0, prevPipe = 0;
+            static double prevShader = 0, prevIdle = 0;
+            uint64_t up = TextureCacheUploadedSoFar();
+            if (frameMs > spikeMs)
+                Log("spike: frame %llu %.1f ms: %llu draws, %.0f KB uploads, %u images %u views %u sets %u pools, shader load %.2f ms, cp idle %.2f ms, %llu draws waiting for pipelines",
+                    (unsigned long long)r.swapCount, frameMs, (unsigned long long)(r.drawCount - prevDraws), (up - prevUp) / 1024.0,
+                    g_tcNew[6] + g_tcNew[2] - prevNew[6] - prevNew[2], g_tcNew[0] - prevNew[0], g_tcNew[7] - prevNew[7], g_tcNew[3] - prevNew[3],
+                    r.shaderMs - prevShader, g_cpIdleTotalMs - prevIdle, (unsigned long long)(r.pipelinePendingSkips - prevPipe));
+            memcpy(prevNew, g_tcNew, sizeof(prevNew));
+            prevDraws = r.drawCount; prevUp = up; prevShader = r.shaderMs; prevIdle = g_cpIdleTotalMs; prevPipe = r.pipelinePendingSkips;
+        }
+        lastSwap = now;
+    }
+    if (r.swapCount % 120 == 0)
+    {
+        auto now = std::chrono::steady_clock::now();
+        {
+            // trend over a long session (slowdowns, leaks): real fps, process memory, cache sizes
+            static auto prevStatus = now;
+            double sec = std::chrono::duration<double>(now - prevStatus).count();
+            prevStatus = now;
+            long rssPages = 0;
+            if (FILE* f = fopen("/proc/self/statm", "r")) { long vm; if (fscanf(f, "%ld %ld", &vm, &rssPages) != 2) rssPages = 0; fclose(f); }
+            extern size_t TextureCacheEntries(), TextureCacheGraveyard();
+            // CPU temperature (Linux hwmon: k10temp / coretemp / cpu_thermal): laptops slow down when hot
+            static std::string tempPath = [] {
+                for (int i = 0; i < 16; i++)
+                {
+                    char p[96], name[64] = {};
+                    snprintf(p, sizeof(p), "/sys/class/hwmon/hwmon%d/name", i);
+                    if (FILE* f = fopen(p, "r")) { if (!fgets(name, sizeof(name), f)) name[0] = 0; fclose(f); } else continue;
+                    if (!strncmp(name, "k10temp", 7) || !strncmp(name, "coretemp", 8) || !strncmp(name, "cpu_thermal", 11))
+                    {
+                        snprintf(p, sizeof(p), "/sys/class/hwmon/hwmon%d/temp1_input", i);
+                        return std::string(p);
+                    }
+                }
+                return std::string();
+            }();
+            int tempC = -1;
+            if (!tempPath.empty()) if (FILE* f = fopen(tempPath.c_str(), "r")) { int mc; if (fscanf(f, "%d", &mc) == 1) tempC = mc / 1000; fclose(f); }
+            Log("status: CPU %d C, frame %llu, %.1f fps, RSS %ld MB, %zu textures, %zu pipelines, %zu shaders, %zu RTs, %zu resolves, graveyard %zu",
+                tempC, (unsigned long long)r.swapCount, sec > 0 ? 120.0 / sec : 0.0, rssPages * (sysconf(_SC_PAGESIZE) / 1024) / 1024,
+                TextureCacheEntries(), r.pipelines.size(), r.shaders.size(), r.rts.size(), r.resolved.size() + r.resolvedDepth.size(),
+                TextureCacheGraveyard());
+            if (g_vk.guestCopy) Log("status: copy mode, %.2f MB/frame uploaded", WatchCopyTakeStats() / 1048576.0 / 120.0);
+        }
+        Log("renderer: worst frame %.1f ms, shader load %.1f ms (cp thread), pipeline creation %.1f ms (background), %d shaders + %d pipelines compiling, %llu + %llu draws skipped for them",
+            r.worstFrameMs, r.shaderMs, g_pipelineUs.exchange(0) / 1000.0, s_jobsPending.load(), s_pipeJobsPending.load(),
+            (unsigned long long)r.shadersPendingSkips, (unsigned long long)r.pipelinePendingSkips);
+        r.shadersPendingSkips = r.pipelinePendingSkips = 0;
+        extern double g_cpIdleMs, g_cpWaitMs, g_cpIntrMs;
+        r.presentMs += s_presentUs.exchange(0) / 1000.0;   // (async present: on the submit thread)
+        Log("renderer: CP thread per frame: idle %.2f ms, WAIT_REG_MEM %.2f ms, interrupts %.2f ms, acquire+present %.2f ms (acquire %.2f)%s", g_cpIdleMs / 120, g_cpWaitMs / 120, g_cpIntrMs / 120, r.presentMs / 120, r.acquireMs / 120,
+            getenv("BO3_AB_TOGGLE") ? (g_ab ? " [B]" : " [A]") : "");
+        static const uint32_t abEvery = getenv("BO3_AB_TOGGLE") ? uint32_t(atoi(getenv("BO3_AB_TOGGLE"))) : 0;
+        if (abEvery && (r.swapCount / 120) % abEvery == 0) g_ab = !g_ab;
+        r.presentMs = 0;
+        r.acquireMs = 0;
+        g_cpIdleMs = g_cpWaitMs = g_cpIntrMs = 0;
+        Log("renderer: %.0f vertices/frame", r.vertCount / 120.0);
+        r.vertCount = 0;
+        Log("renderer: GPU busy %.2f ms/frame, %.1f barriers/frame, %.1f passes/frame", r.gpuBusyMs / 120.0, (g_vkBarrierCount - r.barriers) / 120.0, r.passCount / 120.0);
+        r.gpuBusyMs = 0; r.barriers = g_vkBarrierCount;
+        Log("renderer: %.1f mid-frame submits/frame, %.1f fence batches/frame, %.1f interrupt waits/frame, %.0f constant blocks/frame", r.submits / 120.0, r.fenceBatches / 120.0, r.interruptWaits / 120.0, r.blockPushes / 120.0);
+        r.blockPushes = 0;
+        if (getenv("BO3_STATE_STATS"))
+        {
+            static const char* kNames[] = { "BindPipeline", "PushConstants", "BindDescriptorSets", "BindDescriptorSets", "SetViewport", "SetScissor", "SetBlendConstants", "SetCullMode", "SetFrontFace", "SetPrimitiveTopology", "SetDepthTestEnable", "SetDepthWriteEnable", "SetDepthCompareOp", "SetStencilTestEnable", "SetDepthBias", "SetStencilOp", "SetStencilCompareMask", "SetStencilWriteMask", "SetStencilReference", "FragmentShadingRate" };
+            std::string st;
+            for (size_t k = 0; k < sizeof(kNames) / sizeof(kNames[0]); k++) { char b[64]; snprintf(b, sizeof(b), " %s %.0f", kNames[k], r.stateChanges[k] / 120.0); st += b; }
+            Log("renderer: state commands per frame:%s", st.c_str());
+        }
+        memset(r.stateChanges, 0, sizeof(r.stateChanges));
+        extern uint32_t g_tcNew[8];
+        Log("renderer: texture cache created %u views, %u samplers, %u 3D images, %u set pools, %u fit copies, %u remaps, %u images, %u sets",
+            g_tcNew[0], g_tcNew[1], g_tcNew[2], g_tcNew[3], g_tcNew[4], g_tcNew[5], g_tcNew[6], g_tcNew[7]);
+        memset(g_tcNew, 0, sizeof(g_tcNew));
+        r.submits = r.fenceBatches = r.interruptWaits = 0;
+        r.worstFrameMs = r.shaderMs = r.pipelineMs = 0;
+        Log("renderer: %llu swaps, %.1f fps, %llu draws, %llu resolves, %zu shaders, %zu pipelines, %zu RTs, %zu resolve targets",
+            (unsigned long long)r.swapCount, 120.0 / std::chrono::duration<double>(now - last).count(),
+            (unsigned long long)r.drawCount, (unsigned long long)r.resolveCount, r.shaders.size(), r.pipelines.size(),
+            r.rts.size(), r.resolved.size());
+        Log("renderer: %.1f passes/frame, %.2f MB/frame texture uploads, %llu memexport draws, %llu guest-write flushes", r.passCount / 120.0, TextureCacheUploadedBytes() / 120.0 / 1048576.0, (unsigned long long)r.memexportDraws, (unsigned long long)r.guestWriteFlushes);
+        r.passCount = 0;
+        Log("renderer: skipped draws: mode %llu, empty %llu, prim %llu, shader %llu, pitch %llu, no-target %llu, pipeline %llu, textures %llu, uniforms %llu, scissor %llu",
+            (unsigned long long)r.skip[0], (unsigned long long)r.skip[1], (unsigned long long)r.skip[2], (unsigned long long)r.skip[3],
+            (unsigned long long)r.skip[4], (unsigned long long)r.skip[5], (unsigned long long)r.skip[6], (unsigned long long)r.skip[7],
+            (unsigned long long)r.skip[8], (unsigned long long)r.skip[9]);
+        last = now;
+    }
+}
+
 void RendererSwap(uint32_t frontBufferPhys, uint32_t width, uint32_t height)
 {
     if (!r.ready) return;
@@ -2212,8 +2835,16 @@ void RendererSwap(uint32_t frontBufferPhys, uint32_t width, uint32_t height)
     // 2) Acquire + blit + present (only this waits for the compositor).
     uint32_t imageIndex = 0;
     auto ta = std::chrono::steady_clock::now();
-    VkResult ar = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, UINT64_MAX, f.acquired, VK_NULL_HANDLE, &imageIndex);
-    r.presentMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta).count();
+    VkResult ar;
+    {
+        std::lock_guard swapLock(s_swapLock);
+        ar = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, UINT64_MAX, f.acquired, VK_NULL_HANDLE, &imageIndex);
+    }
+    {
+        double ams = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta).count();
+        r.presentMs += ams;
+        r.acquireMs += ams;
+    }
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(f.presentCmd, &bi));
@@ -2225,6 +2856,7 @@ void RendererSwap(uint32_t frontBufferPhys, uint32_t width, uint32_t height)
         si.pCommandBuffers = &f.presentCmd;
         QueueSync();
         VK_CHECK(vkResetFences(g_vk.device, 1, &f.fence));
+        WatchFlushForGpu();
         VK_CHECK(vkQueueSubmit(g_vk.queue, 1, &si, f.fence));
         VkRecreateSwapchain();
         CreatePresentSemaphores();
@@ -2263,10 +2895,68 @@ void RendererSwap(uint32_t frontBufferPhys, uint32_t width, uint32_t height)
     si.pCommandBuffers = &pc;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &r.presentReady[imageIndex];
+    if (res) res->img.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    static const bool syncPresent = getenv("BO3_SYNC_PRESENT") != nullptr;   // the previous way (diagnostics)
+    if (!r.pendingShot && !syncPresent)
+    {
+        // The submit thread submits and presents, after the frame's other work (its queue is in
+        // order): vkQueuePresentKHR blocks for the GPU (4.5 ms a frame on an Adreno 618 / Turnip),
+        // which the command processor spent waiting - now it records the next frame meanwhile.
+        VK_CHECK(vkResetFences(g_vk.device, 1, &f.fence));
+        WriteDumps();
+        const VkSemaphore acquired = f.acquired, ready = r.presentReady[imageIndex];
+        const VkFence fence = f.fence;
+        QueueOp([pc, acquired, ready, fence, imageIndex] {
+            VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkSubmitInfo psi{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+            psi.waitSemaphoreCount = 1;
+            psi.pWaitSemaphores = &acquired;
+            psi.pWaitDstStageMask = &ws;
+            psi.commandBufferCount = 1;
+            psi.pCommandBuffers = &pc;
+            psi.signalSemaphoreCount = 1;
+            psi.pSignalSemaphores = &ready;
+            WatchFlushForGpu();
+            VK_CHECK(vkQueueSubmit(g_vk.queue, 1, &psi, fence));
+            uint32_t idx = imageIndex;
+            VkPresentInfoKHR ppi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+            ppi.waitSemaphoreCount = 1;
+            ppi.pWaitSemaphores = &ready;
+            ppi.swapchainCount = 1;
+            ppi.pSwapchains = &g_vk.swapchain;
+            ppi.pImageIndices = &idx;
+            auto tp = std::chrono::steady_clock::now();
+            VkResult pr;
+            {
+                std::lock_guard swapLock(s_swapLock);
+                pr = vkQueuePresentKHR(g_vk.queue, &ppi);
+            }
+            s_presentUs += uint64_t(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - tp).count());
+#ifdef __ANDROID__
+            static uint32_t presented = 0;
+            if (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR)
+                if (++presented == 300) { VkWriteGpuState("ok"); Log("renderer: 300 frames presented"); }
+            static bool warned = false;
+            if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR && !warned) { warned = true; LogError("renderer: vkQueuePresentKHR returned %d", int(pr)); }
+            if (pr == VK_SUBOPTIMAL_KHR) pr = VK_SUCCESS;   // (identity preTransform in landscape: see below)
+#endif
+            if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) s_presentStale = true;
+        });
+        if (s_presentStale.exchange(false) || g_vk.swapchainDirty)
+        {
+            QueueSync();
+            VkRecreateSwapchain();
+            CreatePresentSemaphores();
+        }
+        r.frameIndex = (r.frameIndex + 1) % kFrames;
+        r.swapCount++;
+        AfterPresent();
+        return;
+    }
     QueueSync();   // (the frame's last submit may still be on the submit thread)
     VK_CHECK(vkResetFences(g_vk.device, 1, &f.fence));
-    VK_CHECK(vkQueueSubmit(g_vk.queue, 1, &si, f.fence));
-    if (res) res->img.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    WatchFlushForGpu();
+        VK_CHECK(vkQueueSubmit(g_vk.queue, 1, &si, f.fence));
     WriteDumps();
     if (r.pendingShot)
     {
@@ -2289,7 +2979,20 @@ void RendererSwap(uint32_t frontBufferPhys, uint32_t width, uint32_t height)
     pi.pSwapchains = &g_vk.swapchain;
     pi.pImageIndices = &imageIndex;
     auto tp = std::chrono::steady_clock::now();
-    VkResult pr = vkQueuePresentKHR(g_vk.queue, &pi);
+    VkResult pr;
+    {
+        std::lock_guard swapLock(s_swapLock);
+        pr = vkQueuePresentKHR(g_vk.queue, &pi);
+    }
+#ifdef __ANDROID__
+    {
+        static uint32_t presented = 0;
+        if (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR)
+            if (++presented == 300) { VkWriteGpuState("ok"); Log("renderer: 300 frames presented"); }
+        static bool warned = false;
+        if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR && !warned) { warned = true; LogError("renderer: vkQueuePresentKHR returned %d", int(pr)); }
+    }
+#endif
     r.presentMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
 #ifdef __ANDROID__
     // identity preTransform in landscape is always "suboptimal" (the compositor rotates): keep it
@@ -2302,106 +3005,7 @@ void RendererSwap(uint32_t frontBufferPhys, uint32_t width, uint32_t height)
     }
     r.frameIndex = (r.frameIndex + 1) % kFrames;
     r.swapCount++;
-    if (static const char* sw = getenv("BO3_SCALE_SWITCH"); sw)   // diagnostics: "<frame>:<scale>"
-        if (r.swapCount == strtoull(sw, nullptr, 10) && strchr(sw, ':')) g_pendingScale = uint32_t(R(float(atof(strchr(sw, ':') + 1)) * 6));
-    if (uint32_t ps6 = g_pendingScale.exchange(0); ps6 && std::fabs(float(ps6) / 6.0f - g_scale) > 0.01f)
-    {
-        // New internal resolution: drop every EDRAM render target and resolve image (their
-        // contents are rebuilt by the next frames).
-        QueueSync();
-        vkDeviceWaitIdle(g_vk.device);
-        TextureCacheClearResolves();
-        for (auto& [k, rt] : r.rts) { TextureCacheForgetImage(rt.img.image); VkDestroyImage(rt.img); }
-        for (auto& [k, res] : r.resolved) { TextureCacheForgetImage(res.img.image); VkDestroyImage(res.img); }
-        for (auto& [k, res] : r.resolvedDepth) { TextureCacheForgetImage(res.img.image); VkDestroyImage(res.img); }
-        r.rts.clear();
-        for (auto& m : r.rtMemo) m = {};
-        r.resolved.clear();
-        r.resolvedDepth.clear();
-        r.inPass = false;
-        float ps = float(ps6) / 6.0f;
-        Log("renderer: internal resolution x%g -> x%g", g_scale, ps);
-        g_scale = ps;
-    }
-    {
-        static const uint64_t logFrame = getenv("BO3_FRAME_LOG") ? strtoull(getenv("BO3_FRAME_LOG"), nullptr, 10) : 0;
-        if (g_frameLog) Log("frame: ===== end of frame %llu =====", (unsigned long long)r.swapCount - 1);
-        g_frameLog = logFrame && r.swapCount == logFrame;
-        if (g_frameLog) Log("frame: ===== frame %llu =====", (unsigned long long)r.swapCount);
-    }
-    static auto last = std::chrono::steady_clock::now();
-    static auto lastSwap = std::chrono::steady_clock::now();
-    {
-        auto now = std::chrono::steady_clock::now();
-        double frameMs = std::chrono::duration<double, std::milli>(now - lastSwap).count();
-        r.worstFrameMs = std::max(r.worstFrameMs, frameMs);
-        // BO3_SPIKE_LOG=<ms>: every frame longer than that, with what happened in it
-        static const double spikeMs = getenv("BO3_SPIKE_LOG") ? atof(getenv("BO3_SPIKE_LOG")) : 0;
-        if (spikeMs > 0)
-        {
-            extern uint32_t g_tcNew[8];
-            extern double g_cpIdleTotalMs;
-            uint64_t TextureCacheUploadedSoFar();
-            static uint32_t prevNew[8];
-            static uint64_t prevDraws = 0, prevUp = 0, prevPipe = 0;
-            static double prevShader = 0, prevIdle = 0;
-            uint64_t up = TextureCacheUploadedSoFar();
-            if (frameMs > spikeMs)
-                Log("spike: frame %llu %.1f ms: %llu draws, %.0f KB uploads, %u images %u views %u sets %u pools, shader load %.2f ms, cp idle %.2f ms, %llu draws waiting for pipelines",
-                    (unsigned long long)r.swapCount, frameMs, (unsigned long long)(r.drawCount - prevDraws), (up - prevUp) / 1024.0,
-                    g_tcNew[6] + g_tcNew[2] - prevNew[6] - prevNew[2], g_tcNew[0] - prevNew[0], g_tcNew[7] - prevNew[7], g_tcNew[3] - prevNew[3],
-                    r.shaderMs - prevShader, g_cpIdleTotalMs - prevIdle, (unsigned long long)(r.pipelinePendingSkips - prevPipe));
-            memcpy(prevNew, g_tcNew, sizeof(prevNew));
-            prevDraws = r.drawCount; prevUp = up; prevShader = r.shaderMs; prevIdle = g_cpIdleTotalMs; prevPipe = r.pipelinePendingSkips;
-        }
-        lastSwap = now;
-    }
-    if (r.swapCount % 120 == 0)
-    {
-        auto now = std::chrono::steady_clock::now();
-        Log("renderer: worst frame %.1f ms, shader load %.1f ms (cp thread), pipeline creation %.1f ms (background), %d shaders + %d pipelines compiling, %llu + %llu draws skipped for them",
-            r.worstFrameMs, r.shaderMs, g_pipelineUs.exchange(0) / 1000.0, s_jobsPending.load(), s_pipeJobsPending.load(),
-            (unsigned long long)r.shadersPendingSkips, (unsigned long long)r.pipelinePendingSkips);
-        r.shadersPendingSkips = r.pipelinePendingSkips = 0;
-        extern double g_cpIdleMs, g_cpWaitMs, g_cpIntrMs;
-        Log("renderer: CP thread per frame: idle %.2f ms, WAIT_REG_MEM %.2f ms, interrupts %.2f ms, acquire+present %.2f ms%s", g_cpIdleMs / 120, g_cpWaitMs / 120, g_cpIntrMs / 120, r.presentMs / 120,
-            getenv("BO3_AB_TOGGLE") ? (g_ab ? " [B]" : " [A]") : "");
-        static const uint32_t abEvery = getenv("BO3_AB_TOGGLE") ? uint32_t(atoi(getenv("BO3_AB_TOGGLE"))) : 0;
-        if (abEvery && (r.swapCount / 120) % abEvery == 0) g_ab = !g_ab;
-        r.presentMs = 0;
-        g_cpIdleMs = g_cpWaitMs = g_cpIntrMs = 0;
-        Log("renderer: %.0f vertices/frame", r.vertCount / 120.0);
-        r.vertCount = 0;
-        Log("renderer: GPU busy %.2f ms/frame, %.1f barriers/frame, %.1f passes/frame", r.gpuBusyMs / 120.0, (g_vkBarrierCount - r.barriers) / 120.0, r.passCount / 120.0);
-        r.gpuBusyMs = 0; r.barriers = g_vkBarrierCount;
-        Log("renderer: %.1f mid-frame submits/frame, %.1f fence batches/frame, %.1f interrupt waits/frame, %.0f constant blocks/frame", r.submits / 120.0, r.fenceBatches / 120.0, r.interruptWaits / 120.0, r.blockPushes / 120.0);
-        r.blockPushes = 0;
-        if (getenv("BO3_STATE_STATS"))
-        {
-            static const char* kNames[] = { "BindPipeline", "PushConstants", "BindDescriptorSets", "BindDescriptorSets", "SetViewport", "SetScissor", "SetBlendConstants", "SetCullMode", "SetFrontFace", "SetPrimitiveTopology", "SetDepthTestEnable", "SetDepthWriteEnable", "SetDepthCompareOp", "SetStencilTestEnable", "SetDepthBias", "SetStencilOp", "SetStencilCompareMask", "SetStencilWriteMask", "SetStencilReference", "FragmentShadingRate" };
-            std::string st;
-            for (size_t k = 0; k < sizeof(kNames) / sizeof(kNames[0]); k++) { char b[64]; snprintf(b, sizeof(b), " %s %.0f", kNames[k], r.stateChanges[k] / 120.0); st += b; }
-            Log("renderer: state commands per frame:%s", st.c_str());
-        }
-        memset(r.stateChanges, 0, sizeof(r.stateChanges));
-        extern uint32_t g_tcNew[8];
-        Log("renderer: texture cache created %u views, %u samplers, %u 3D images, %u set pools, %u fit copies, %u remaps, %u images, %u sets",
-            g_tcNew[0], g_tcNew[1], g_tcNew[2], g_tcNew[3], g_tcNew[4], g_tcNew[5], g_tcNew[6], g_tcNew[7]);
-        memset(g_tcNew, 0, sizeof(g_tcNew));
-        r.submits = r.fenceBatches = r.interruptWaits = 0;
-        r.worstFrameMs = r.shaderMs = r.pipelineMs = 0;
-        Log("renderer: %llu swaps, %.1f fps, %llu draws, %llu resolves, %zu shaders, %zu pipelines, %zu RTs, %zu resolve targets",
-            (unsigned long long)r.swapCount, 120.0 / std::chrono::duration<double>(now - last).count(),
-            (unsigned long long)r.drawCount, (unsigned long long)r.resolveCount, r.shaders.size(), r.pipelines.size(),
-            r.rts.size(), r.resolved.size());
-        Log("renderer: %.1f passes/frame, %.2f MB/frame texture uploads, %llu memexport draws, %llu guest-write flushes", r.passCount / 120.0, TextureCacheUploadedBytes() / 120.0 / 1048576.0, (unsigned long long)r.memexportDraws, (unsigned long long)r.guestWriteFlushes);
-        r.passCount = 0;
-        Log("renderer: skipped draws: mode %llu, empty %llu, prim %llu, shader %llu, pitch %llu, no-target %llu, pipeline %llu, textures %llu, uniforms %llu, scissor %llu",
-            (unsigned long long)r.skip[0], (unsigned long long)r.skip[1], (unsigned long long)r.skip[2], (unsigned long long)r.skip[3],
-            (unsigned long long)r.skip[4], (unsigned long long)r.skip[5], (unsigned long long)r.skip[6], (unsigned long long)r.skip[7],
-            (unsigned long long)r.skip[8], (unsigned long long)r.skip[9]);
-        last = now;
-    }
+    AfterPresent();
 }
 
 // The guest learns that GPU work is done from fences the command processor writes (memory
@@ -2425,6 +3029,7 @@ void RendererFlushGuestWrites()
         si.pCommandBuffers = &f.cmd;
         QueueSync();
         VK_CHECK(vkResetFences(g_vk.device, 1, &f.fence));
+        WatchFlushForGpu();
         VK_CHECK(vkQueueSubmit(g_vk.queue, 1, &si, f.fence));
         r.midFrameRestart = true;
     }
@@ -2454,6 +3059,7 @@ std::deque<std::pair<uint32_t, uint32_t>> s_inFlightWords;   // 32-bit writes of
 void CompletionThread()
 {
     pthread_setname_np(pthread_self(), "gpu-fences");
+    ProfilerAttachHostThread("gpu-fences");
     for (;;)
     {
         DeferredBatch b;
@@ -2486,6 +3092,7 @@ bool s_subBusy = false;
 void SubmitThread()
 {
     pthread_setname_np(pthread_self(), "gpu-submit");
+    ProfilerAttachHostThread("gpu-submit");
     for (;;)
     {
         std::function<void()> job;
@@ -2528,7 +3135,8 @@ void SubmitOne(VkCommandBuffer cb, VkFence fence)
     VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cb;
-    VK_CHECK(vkQueueSubmit(g_vk.queue, cb ? 1 : 0, cb ? &si : nullptr, fence));
+    WatchFlushForGpu();
+        VK_CHECK(vkQueueSubmit(g_vk.queue, cb ? 1 : 0, cb ? &si : nullptr, fence));
 }
 
 // After submitting work: the pending writes become visible when it completes.
@@ -2666,7 +3274,8 @@ void RendererSubmitPending()
 }
 
 float RendererScale() { return g_scale; }
-void RendererSetScale(float s) { g_pendingScale = uint32_t(R(std::clamp(s, 0.5f, 4.0f) * 6)); Log("renderer: scale request x%g (now x%g)", s, g_scale); }   // (1/6 steps: 0.5 = 360p)
+void RendererSetShadowQuality(int q) { g_pendingShadows = std::clamp(q, 0, 1); }
+void RendererSetScale(float s) { g_pendingScale = uint32_t(R(std::clamp(s, 0.25f, 4.0f) * 60)); Log("renderer: scale request x%g (now x%g)", s, g_scale); }   // (1/60 steps: 0.25 = 180p, 0.35 = 252p, 0.5 = 360p)
 
 bool g_ab = false;
 bool AbOld(const char* name)

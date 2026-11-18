@@ -7,6 +7,16 @@
 
 #include <mutex>
 
+// SPIR-V for the device's Vulkan version (1.1 drivers do not take SPIR-V 1.6)
+static int s_vkMinor = 3;
+void ShaderCompilerSetVulkanVersion(int minor) { s_vkMinor = minor; }
+static void SetTargets(glslang::TShader& shader)
+{
+    if (s_vkMinor >= 3) { shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_3); shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_6); }
+    else if (s_vkMinor == 2) { shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_2); shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_5); }
+    else { shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_1); shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_3); }
+}
+
 bool CompileGlsl(bool pixel, const std::string& glsl, std::vector<uint32_t>& spirv, std::string& error)
 {
     static std::once_flag init;
@@ -16,8 +26,7 @@ bool CompileGlsl(bool pixel, const std::string& glsl, std::vector<uint32_t>& spi
     const char* src = glsl.c_str();
     shader.setStrings(&src, 1);
     shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 100);
-    shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_3);
-    shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_6);
+    SetTargets(shader);
     EShMessages msgs = EShMessages(EShMsgSpvRules | EShMsgVulkanRules);
     if (!shader.parse(GetDefaultResources(), 460, false, msgs))
     {
@@ -49,8 +58,7 @@ bool CompileGlslStage(int stageIndex, const std::string& glsl, std::vector<uint3
     const char* src = glsl.c_str();
     shader.setStrings(&src, 1);
     shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 100);
-    shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_3);
-    shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_6);
+    SetTargets(shader);
     EShMessages msgs = EShMessages(EShMsgSpvRules | EShMsgVulkanRules);
     if (!shader.parse(GetDefaultResources(), 460, false, msgs)) { error = shader.getInfoLog(); return false; }
     glslang::TProgram program;

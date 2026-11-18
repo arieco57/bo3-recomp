@@ -83,31 +83,44 @@ void ProfilerAttachThisThread(bool named)
     itimerspec its{};
     its.it_interval.tv_nsec = its.it_value.tv_nsec = 1000000;
     timer_settime(timer, 0, &its, nullptr);
-    std::thread([start, dur] {
-        std::this_thread::sleep_for(std::chrono::duration<double>(start));
-        s_on = true;
-        Log("profiler: sampling");
-        std::this_thread::sleep_for(std::chrono::duration<double>(dur));
-        s_on = false;
-        size_t n = std::min(s_n.load(), kMax);
-        FILE* f = fopen("bo3_profile.txt", "w");
-        if (!f) return;
-        fprintf(f, "samples %zu\n", n);
-        for (size_t i = 0; i < n; i++) fprintf(f, "%lx\n", (unsigned long)s_ips[i]);
-        if (s_stacks)
-        {
-            size_t ns = std::min(n, kStackMax);
-            fprintf(f, "stacks %zu\n", ns);
-            for (size_t i = 0; i < ns; i++)
+    // a second window (BO3_PROFILE=start,dur,start2,dur2 -> bo3_profile_2.txt): compare two moments of a session
+    double start2 = -1, dur2 = 0;
+    if (const char* c = strchr(e, ',')) if ((c = strchr(c + 1, ','))) { start2 = atof(c + 1); if (const char* d = strchr(c + 1, ',')) dur2 = atof(d + 1); }
+    std::thread([start, dur, start2, dur2] {
+        auto window = [](double from, double len, const char* file) {
+            s_n = 0;
+            s_on = true;
+            Log("profiler: sampling");
+            std::this_thread::sleep_for(std::chrono::duration<double>(len));
+            s_on = false;
+            size_t n = std::min(s_n.load(), kMax);
+            FILE* f = fopen(file, "w");
+            if (!f) return;
+            fprintf(f, "samples %zu\n", n);
+            for (size_t i = 0; i < n; i++) fprintf(f, "%lx\n", (unsigned long)s_ips[i]);
+            if (s_stacks)
             {
-                for (size_t k = 0; k < kDepth && s_stacks[i * kDepth + k]; k++) fprintf(f, "%lx ", (unsigned long)s_stacks[i * kDepth + k]);
-                fprintf(f, "\n");
+                size_t ns = std::min(n, kStackMax);
+                fprintf(f, "stacks %zu\n", ns);
+                for (size_t i = 0; i < ns; i++)
+                {
+                    for (size_t k = 0; k < kDepth && s_stacks[i * kDepth + k]; k++) fprintf(f, "%lx ", (unsigned long)s_stacks[i * kDepth + k]);
+                    fprintf(f, "\n");
+                }
             }
+            fprintf(f, "maps\n");
+            if (FILE* m = fopen("/proc/self/maps", "r")) { char line[512]; while (fgets(line, sizeof(line), m)) fputs(line, f); fclose(m); }
+            fclose(f);
+            Log("profiler: %zu samples written to %s", n, file);
+            (void)from;
+        };
+        std::this_thread::sleep_for(std::chrono::duration<double>(start));
+        window(start, dur, "bo3_profile.txt");
+        if (start2 > start + dur)
+        {
+            std::this_thread::sleep_for(std::chrono::duration<double>(start2 - start - dur));
+            window(start2, dur2 > 0 ? dur2 : dur, "bo3_profile_2.txt");
         }
-        fprintf(f, "maps\n");
-        if (FILE* m = fopen("/proc/self/maps", "r")) { char line[512]; while (fgets(line, sizeof(line), m)) fputs(line, f); fclose(m); }
-        fclose(f);
-        Log("profiler: %zu samples written to bo3_profile.txt", n);
     }).detach();
 }
 
@@ -170,4 +183,10 @@ void ProfilerWatchAddress(uint32_t addr, double start)
         for (auto& [ip, n] : ips) Log("watch: write from host ip 0x%llx (%d times)", (unsigned long long)ip, n);
         Log("watch: done");
     }).detach();
+}
+
+void ProfilerAttachHostThread(const char* name)
+{
+    const char* want = getenv("BO3_PROFILE_THREAD");
+    if (want && !strcmp(want, name)) ProfilerAttachThisThread(true);
 }

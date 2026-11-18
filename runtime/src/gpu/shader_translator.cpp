@@ -416,6 +416,22 @@ struct Translator
             L(Fmt("vfIndex = %s;", (rounded ? "int(floor(" + reg + " + 0.5))" : "int(floor(" + reg + "))").c_str()));
         }
         uint32_t fmt = uint32_t(in.data_format());
+        if (fc < 96)
+        {
+            // (what the copy mode uploads for a draw: vertex index range x stride, the dwords read)
+            auto& f = result.vfFlags[fc];
+            uint32_t off = uint32_t(std::max(in.offset(), 0));
+            bool vertexIndex = src == 0 && (srcSwz & 3) == 0 && !in.is_src_relative();
+            if (!(f & 1)) { result.vfMinOff[fc] = uint16_t(off); result.vfMaxEnd[fc] = uint16_t(off + 4); result.vfStride[fc] = uint16_t(stride); }
+            else
+            {
+                result.vfMinOff[fc] = uint16_t(std::min<uint32_t>(result.vfMinOff[fc], off));
+                result.vfMaxEnd[fc] = uint16_t(std::max<uint32_t>(result.vfMaxEnd[fc], off + 4));
+                result.vfStride[fc] = uint16_t(std::max<uint32_t>(result.vfStride[fc], stride));
+            }
+            f |= 1;
+            if (!vertexIndex) f |= 2;
+        }
         float expScale = std::ldexp(1.0f, in.exp_adjust());
         std::string value = Fmt("vfetch(%u, %s, %u, %d, %u, %d, %d, %d, %.9g)", fc, idx.c_str(), stride, in.offset(),
                                 fmt, in.is_signed() ? 1 : 0, in.is_normalized() ? 1 : 0,
@@ -447,16 +463,27 @@ struct Translator
             float bias = in.lod_bias();
             std::string value;
             bool denorm = in.unnormalized_coordinates();
+            // Texel offsets of the instruction (+-0.5 steps: the 4 taps of shadow-map PCF), in texels
+            // for unnormalized coordinates, else divided by the texture size.
+            static const bool noOffsets = getenv("BO3_NO_FETCH_OFFSETS") != nullptr;   // (A/B tests)
+            float off[3] = { in.offset_x(), in.offset_y(), in.offset_z() };
+            if (noOffsets) off[0] = off[1] = off[2] = 0;
+            auto oc = [&](int i, const char* size) {
+                if (off[i] == 0) return comp(i);
+                return denorm ? Fmt("(%s + %.6g)", comp(i).c_str(), off[i]) : Fmt("(%s + %.6g / %s)", comp(i).c_str(), off[i], size);
+            };
+            std::string ts = Fmt("tsize(%u)", t), ts3 = Fmt("vec3(textureSize(tex3D[%u], 0))", t);
             switch (dim)
             {
             case xenos::FetchOpDimension::k1D:
-                value = Fmt("tfetch2D(%u, vec2(%s, 0.5), %d, %s, %.6g)", t, comp(0).c_str(), denorm ? 1 : 0, lod.c_str(), bias);
+                value = Fmt("tfetch2D(%u, vec2(%s, 0.5), %d, %s, %.6g)", t, oc(0, (ts + ".x").c_str()).c_str(), denorm ? 1 : 0, lod.c_str(), bias);
                 break;
             case xenos::FetchOpDimension::k2D:
-                value = Fmt("tfetch2D(%u, vec2(%s, %s), %d, %s, %.6g)", t, comp(0).c_str(), comp(1).c_str(), denorm ? 1 : 0, lod.c_str(), bias);
+                value = Fmt("tfetch2D(%u, vec2(%s, %s), %d, %s, %.6g)", t, oc(0, (ts + ".x").c_str()).c_str(), oc(1, (ts + ".y").c_str()).c_str(), denorm ? 1 : 0, lod.c_str(), bias);
                 break;
             case xenos::FetchOpDimension::k3DOrStacked:
-                value = Fmt("tfetch3D(%u, vec3(%s, %s, %s), %d, %s, %.6g)", t, comp(0).c_str(), comp(1).c_str(), comp(2).c_str(), denorm ? 1 : 0, lod.c_str(), bias);
+                value = Fmt("tfetch3D(%u, vec3(%s, %s, %s), %d, %s, %.6g)", t, oc(0, (ts3 + ".x").c_str()).c_str(), oc(1, (ts3 + ".y").c_str()).c_str(),
+                            oc(2, (ts3 + ".z").c_str()).c_str(), denorm ? 1 : 0, lod.c_str(), bias);
                 break;
             case xenos::FetchOpDimension::kCube:
                 value = Fmt("tfetchCube(%u, vec3(%s, %s, %s), %s, %.6g)", t, comp(0).c_str(), comp(1).c_str(), comp(2).c_str(), lod.c_str(), bias);
@@ -472,7 +499,15 @@ struct Translator
             FetchDest(in.dest(), in.is_dest_relative(), in.dest_swizzle(), "vec4(0.0)");
             break;
         case FetchOpcode::kGetTextureWeights:
-            FetchDest(in.dest(), in.is_dest_relative(), in.dest_swizzle(), Fmt("vec4(fract(vec2(%s, %s) * tsize(%u) - 0.5), 0.0, 0.0)", comp(0).c_str(), comp(1).c_str(), t));
+        {
+            // bilinear weights at the (offset) position: fract(texel coordinate - 0.5)
+            static const bool noOffsets = getenv("BO3_NO_FETCH_OFFSETS") != nullptr;
+            float ox = noOffsets ? 0 : in.offset_x(), oy = noOffsets ? 0 : in.offset_y();
+            if (in.unnormalized_coordinates())
+                FetchDest(in.dest(), in.is_dest_relative(), in.dest_swizzle(), Fmt("vec4(fract(vec2(%s, %s) + vec2(%.6g, %.6g) - 0.5), 0.0, 0.0)", comp(0).c_str(), comp(1).c_str(), ox, oy));
+            else
+                FetchDest(in.dest(), in.is_dest_relative(), in.dest_swizzle(), Fmt("vec4(fract(vec2(%s, %s) * tsize(%u) + vec2(%.6g, %.6g) - 0.5), 0.0, 0.0)", comp(0).c_str(), comp(1).c_str(), t, ox, oy));
+        }
             break;
         default:
             // gradients / border colour: not needed for a first pass
@@ -526,51 +561,93 @@ struct Translator
             }
         }
 
-        // Straight-line shaders (only exec / conditional exec blocks - most of them): emit the
-        // blocks in order. The pc state machine below is only needed for loops, calls and
-        // jumps; drivers optimize it much worse (BO3_SHADER_STATE_MACHINE=1 forces it).
+        // Structured shaders: exec / conditional exec blocks, forward jumps and returns (no loops or
+        // calls - nearly all of them). Blocks are emitted in order; a forward jump at i to t sets a
+        // flag jI and the blocks it skips are wrapped in if (!jI) - uniform branches the driver
+        // optimizes like any other code. The pc state machine below is only for loops, calls and
+        // backward jumps; drivers optimize it much worse (BO3_SHADER_STATE_MACHINE=1 forces it).
         bool structured = getenv("BO3_SHADER_STATE_MACHINE") == nullptr;
-        for (auto& c : cf)
+        size_t reach = cf.size();   // (instructions after an unconditional end that nothing jumps over are unreachable)
         {
-            auto op = c.opcode();
-            if (op == ControlFlowOpcode::kLoopStart || op == ControlFlowOpcode::kLoopEnd || op == ControlFlowOpcode::kCondCall ||
-                op == ControlFlowOpcode::kReturn || op == ControlFlowOpcode::kCondJmp)
-                structured = false;
-            if (op == ControlFlowOpcode::kExecEnd) break;   // the rest is unreachable
+            uint32_t maxTarget = 0;
+            for (size_t i = 0; i < cf.size(); i++)
+            {
+                auto op = cf[i].opcode();
+                if (op == ControlFlowOpcode::kLoopStart || op == ControlFlowOpcode::kLoopEnd || op == ControlFlowOpcode::kCondCall)
+                    structured = false;
+                if (op == ControlFlowOpcode::kCondJmp)
+                {
+                    uint32_t t = cf[i].cond_jmp.address();
+                    if (t <= i) structured = false;
+                    maxTarget = std::max(maxTarget, t);
+                }
+                if (op == ControlFlowOpcode::kExecEnd && maxTarget <= i) { reach = i + 1; break; }
+            }
         }
         if (structured)
         {
+            std::vector<std::pair<uint32_t, uint32_t>> jumps;   // (source, target)
+            for (size_t i = 0; i < reach; i++)
+                if (cf[i].opcode() == ControlFlowOpcode::kCondJmp) jumps.push_back({ uint32_t(i), cf[i].cond_jmp.address() });
             out += "void xmain() {\n";
-            for (auto& c : cf)
+            for (auto& [src, tgt] : jumps) L(Fmt("bool j%u = false;", src));
+            for (size_t i = 0; i < reach; i++)
             {
-                bool end = false;
+                const auto& c = cf[i];
+                // jumps taken over this instruction
+                std::string skip;
+                for (auto& [src, tgt] : jumps)
+                    if (src < i && tgt > i) skip += (skip.empty() ? "" : " || ") + Fmt("j%u", src);
+                bool guarded = !skip.empty();
+                auto open = [&]() { if (guarded) L("if (!(" + skip + ")) {"); };
+                auto close = [&]() { if (guarded) L("}"); };
                 switch (c.opcode())
                 {
                 case ControlFlowOpcode::kExec:
                 case ControlFlowOpcode::kExecEnd:
+                    open();
                     ExecBody(c.exec.address(), c.exec.count(), c.exec.sequence());
-                    end = c.opcode() == ControlFlowOpcode::kExecEnd;
+                    if (c.opcode() == ControlFlowOpcode::kExecEnd && i + 1 < reach) L("return;");
+                    close();
                     break;
                 case ControlFlowOpcode::kCondExec:
                 case ControlFlowOpcode::kCondExecEnd:
                 case ControlFlowOpcode::kCondExecPredClean:
                 case ControlFlowOpcode::kCondExecPredCleanEnd:
+                    open();
                     L("if " + BoolTest(c.cond_exec.bool_address(), c.cond_exec.condition()) + " {");
                     ExecBody(c.cond_exec.address(), c.cond_exec.count(), c.cond_exec.sequence());
                     L("}");
-                    end = DoesControlFlowOpcodeEndShader(c.opcode());
+                    if (DoesControlFlowOpcodeEndShader(c.opcode()) && i + 1 < reach) L("return;");
+                    close();
                     break;
                 case ControlFlowOpcode::kCondExecPred:
                 case ControlFlowOpcode::kCondExecPredEnd:
+                    open();
                     L(Fmt("if (p0 == %s) {", c.cond_exec_pred.condition() ? "true" : "false"));
                     ExecBody(c.cond_exec_pred.address(), c.cond_exec_pred.count(), c.cond_exec_pred.sequence());
                     L("}");
-                    end = DoesControlFlowOpcodeEndShader(c.opcode());
+                    if (DoesControlFlowOpcodeEndShader(c.opcode()) && i + 1 < reach) L("return;");
+                    close();
+                    break;
+                case ControlFlowOpcode::kCondJmp:
+                {
+                    std::string cond = c.cond_jmp.is_unconditional() ? "true" :
+                                       c.cond_jmp.is_predicated() ? Fmt("p0 == %s", c.cond_jmp.condition() ? "true" : "false") :
+                                       BoolTest(c.cond_jmp.bool_address(), c.cond_jmp.condition());
+                    open();
+                    L(Fmt("j%zu = %s;", i, cond.c_str()));
+                    close();
+                    break;
+                }
+                case ControlFlowOpcode::kReturn:   // (no calls: the end of the shader)
+                    open();
+                    L("return;");
+                    close();
                     break;
                 default:
                     break;
                 }
-                if (end) break;
             }
             out += "}\n";
             return;
@@ -663,6 +740,14 @@ struct Translator
 const char* kCommon = R"(#version 460
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_spirv_intrinsics : require
+// Keep inf / nan / signed zero exactly (SPV_KHR_float_controls SignedZeroInfNanPreserve): the Xenos
+// math emulation below tests isinf / isnan, which the driver's compiler may otherwise fold away
+// (then NaNs reach the pixels: black specks on skinned characters on Adreno).
+// (light shaders, XLITE: neither this nor the Xenos multiply rules - faster, rarely different)
+#if !defined(XLITE) && !defined(NO_FLOAT_CONTROLS)
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4466], 4461, 32);
+#endif
 
 // Guest physical memory (512 MiB). Every index is masked to it: Xenos addresses are 29-bit
 // physical, and a garbage fetch constant must not fault the host GPU.
@@ -744,10 +829,15 @@ void memExport(uint k, vec4 v) {
 }
 
 // Xenos "legacy" multiply: 0 * anything (including inf/nan) = 0.
+#ifdef XLITE
+float xmul1(float a, float b) { return a * b; }
+vec4 xmul(vec4 a, vec4 b) { return a * b; }
+#else
 float xmul1(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
 vec4 xmul(vec4 a, vec4 b) {
     return mix(a * b, vec4(0.0), bvec4(uvec4(equal(a, vec4(0.0))) | uvec4(equal(b, vec4(0.0)))));
 }
+#endif
 float xdot4(vec4 a, vec4 b) { vec4 m = xmul(a, b); return (m.x + m.y) + (m.z + m.w); }
 float xlogc(float a) { float l = log2(a); return isinf(l) && l < 0.0 ? -3.402823466e38 : l; }
 float xrcpc(float a) { float v = 1.0 / a; return isinf(v) ? (v > 0.0 ? 3.402823466e38 : -3.402823466e38) : v; }
@@ -856,6 +946,10 @@ vec4 tfetchCube(uint t, vec3 coord, float lod, float bias) {
 )";
 }
 
+static int s_vkMinor = 3;
+static bool s_floatControls = true;
+void ShaderTranslatorSetDevice(int vulkanMinor, bool floatControls) { s_vkMinor = vulkanMinor; s_floatControls = floatControls; }
+
 TranslatedShader TranslateShader(bool pixel, const uint32_t* code, uint32_t dwords)
 {
     Translator t{ pixel, code, dwords };
@@ -869,6 +963,8 @@ TranslatedShader TranslateShader(bool pixel, const uint32_t* code, uint32_t dwor
     replaceAll("PUSH_OFFSET", pixel ? "64" : "0");
     replaceAll("MEM_QUALIFIER", t.result.memexports ? "" : "readonly");
     if (t.result.memexports) head.insert(head.find('\n') + 1, "#define MEMEXPORT 1\n");
+    if (ShaderTranslatorLite()) head.insert(head.find('\n') + 1, "#define XLITE 1\n");
+    if (!s_floatControls) head.insert(head.find('\n') + 1, "#define NO_FLOAT_CONTROLS 1\n");
     // Pixel shaders receive the 16 interpolators in r0..r15.
     const uint32_t numTemps = t.relativeTemps ? 64u : std::max(t.maxTemp + 1, pixel ? 16u : 1u);
     replaceAll("NUM_TEMPS", std::to_string(numTemps));
@@ -895,15 +991,56 @@ uint fetchIndex(uint i) {
     return (byteAddr & 2u) != 0u ? (w >> 16) : (w & 0xFFFFu);
 }
 
-void main() {
-    for (int i = 0; i < NUM_TEMPS; i++) r[i] = vec4(0.0);
-    for (int i = 0; i < 16; i++) oInterp[i] = vec4(0.0);
-    uint index = fetchIndex(uint(gl_VertexIndex)) + drawInfo.w;
-    r[0].x = float(index);
+// one guest vertex: the translated shader for guest vertex i (of the draw)
+void runVertex(uint i) {
+    for (int k = 0; k < NUM_TEMPS; k++) r[k] = vec4(0.0);
+    for (int k = 0; k < 16; k++) oInterp[k] = vec4(0.0);
+    oPos = vec4(0.0, 0.0, 0.0, 1.0);
+    r[0].x = float(fetchIndex(i) + drawInfo.w);
     xmain();
-    gl_Position = vec4(oPos.xy * ndcScale.xy + oPos.ww * ndcOffset.xy, oPos.z * ndcScale.z + oPos.w * ndcOffset.z, oPos.w);
+}
+vec4 hostPos() { return vec4(oPos.xy * ndcScale.xy + oPos.ww * ndcOffset.xy, oPos.z * ndcScale.z + oPos.w * ndcOffset.z, oPos.w); }
+
+#if defined(PRIM_RECT)
+// No geometry shaders (Mali, PowerVR...): a rect list drawn as 6 host vertices per rectangle. Each
+// runs the guest shader for the 3 corners given, then outputs c, a, b / b, a, d (the strip of the
+// geometry shader: d mirrors c, the corner opposite the longest edge, across the a-b diagonal).
+void main() {
+    uint prim = uint(gl_VertexIndex) / 6u, k = uint(gl_VertexIndex) % 6u;
+    vec4 P[3]; vec4 I[3][16];
+    for (int j = 0; j < 3; j++) { runVertex(prim * 3u + uint(j)); P[j] = hostPos(); for (int q = 0; q < 16; q++) I[j][q] = oInterp[q]; }
+    vec2 p0 = P[0].xy / P[0].w, p1 = P[1].xy / P[1].w, p2 = P[2].xy / P[2].w;
+    float d01 = distance(p0, p1), d12 = distance(p1, p2), d20 = distance(p2, p0);
+    int c, a, b;
+    if (d01 >= d12 && d01 >= d20) { c = 2; a = 0; b = 1; }
+    else if (d12 >= d01 && d12 >= d20) { c = 0; a = 1; b = 2; }
+    else { c = 1; a = 2; b = 0; }
+    int sel = k == 0u ? c : (k == 1u || k == 4u) ? a : b;
+    if (k == 5u) {
+        gl_Position = P[a] + P[b] - P[c];
+        for (int q = 0; q < 16; q++) oInterp[q] = I[a][q] + I[b][q] - I[c][q];
+    } else {
+        gl_Position = P[sel];
+        for (int q = 0; q < 16; q++) oInterp[q] = I[sel][q];
+    }
     gl_PointSize = 1.0;
 }
+#elif defined(PRIM_QUAD)
+// No geometry shaders: a quad list as 6 host vertices per quad (0, 1, 3 / 3, 1, 2 - the strip 0, 1, 3, 2)
+void main() {
+    uint quad = uint(gl_VertexIndex) / 6u, k = uint(gl_VertexIndex) % 6u;
+    const uint corner[6] = uint[6](0u, 1u, 3u, 3u, 1u, 2u);
+    runVertex(quad * 4u + corner[k]);
+    gl_Position = hostPos();
+    gl_PointSize = 1.0;
+}
+#else
+void main() {
+    runVertex(uint(gl_VertexIndex));
+    gl_Position = hostPos();
+    gl_PointSize = 1.0;
+}
+#endif
 )";
     }
     else
@@ -922,7 +1059,7 @@ void main() {
     for (int i = 0; i < 16; i++) r[i] = iInterp[i];
     // host sample grid: MSAA (x, y) and the resolution scale; pg is the guest pixel position
     vec2 ss = vec2(float(max(psInfo.w & 15u, 1u)), float(max((psInfo.w >> 4) & 15u, 1u)));
-    float rs = float(max((psInfo.w >> 8) & 255u, 1u)) / 6.0;   // resolution scale (x6 encoded: 2/3, 1.5x)
+    float rs = float(max((psInfo.w >> 8) & 255u, 1u)) / 60.0;   // resolution scale (x60 encoded: 0.25x, 0.35x, 2/3, 1.5x)
     vec4 pg = vec4((floor(gl_FragCoord.xy / ss) + 0.5) / rs, 0.0, gl_FrontFacing ? 0.0 : 1.0);
 )") + paramGen + R"(    for (int i = 0; i < 4; i++) oC[i] = vec4(0.0);
     xmain();
@@ -944,7 +1081,34 @@ void main() {
     if (!t.result.error.empty()) return t.result;
     std::string err;
     if (!CompileGlsl(pixel, t.result.glsl, t.result.spirv, err)) t.result.error = err;
+    else if (!pixel && ShaderTranslatorPrimEmu())
+    {
+        // no geometry shaders on this GPU: the rect list / quad list variants of the vertex shader
+        for (int v = 0; v < 2 && t.result.error.empty(); v++)
+        {
+            std::string g = t.result.glsl;
+            g.insert(g.find('\n') + 1, v == 0 ? "#define PRIM_RECT 1\n" : "#define PRIM_QUAD 1\n");
+            if (!CompileGlsl(false, g, v == 0 ? t.result.spirvRect : t.result.spirvQuad, err)) t.result.error = err;
+        }
+    }
     return t.result;
 }
 
-const char* ShaderTranslatorBuildId() { return __DATE__ " " __TIME__; }
+// Light shaders (video options "Shaders: Livianos", or BO3_SHADER_LITE=1/0): set before the first
+// shader is translated (it is part of the disk cache's identity).
+static int s_lite = -1;
+void ShaderTranslatorSetLite(bool on) { if (s_lite < 0) s_lite = on ? 1 : 0; }
+static bool s_primEmu = false;
+void ShaderTranslatorSetPrimEmu(bool on) { s_primEmu = on; }
+bool ShaderTranslatorPrimEmu() { return s_primEmu; }
+bool ShaderTranslatorLite()
+{
+    if (const char* e = getenv("BO3_SHADER_LITE")) return *e == '1';
+    return s_lite == 1;
+}
+const char* ShaderTranslatorBuildId()
+{
+    static std::string id = std::string(__DATE__ " " __TIME__) + (getenv("BO3_NO_FETCH_OFFSETS") ? " no-offsets" : "") + (ShaderTranslatorLite() ? " lite" : "") + (s_primEmu ? " primemu" : "") +
+                            " vk1." + std::to_string(s_vkMinor) + (s_floatControls ? "" : " nofc");
+    return id.c_str();
+}

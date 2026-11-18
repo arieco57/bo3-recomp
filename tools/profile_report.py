@@ -32,12 +32,30 @@ def syms(path):
             addrs.append(int(p[0], 16)); names.append(p[2])
     symcache[path] = (addrs, names)
     return symcache[path]
+loads = {}
+def to_vaddr(path, fileoff):
+    # file offset -> link-time address (Android libraries: segments are not at vaddr == offset)
+    if path not in loads:
+        segs = []
+        out = subprocess.run(['readelf', '-lW', path], capture_output=True, text=True).stdout
+        for l in out.split('\n'):
+            p = l.split()
+            if len(p) >= 6 and p[0] == 'LOAD':
+                segs.append((int(p[1], 16), int(p[2], 16), int(p[4], 16)))   # offset, vaddr, filesz
+        loads[path] = segs
+    for o, v, sz in loads[path]:
+        if o <= fileoff < o + max(sz, 1): return fileoff - o + v
+    return fileoff
+def offset_of(ip, m):
+    path = m[3]
+    if path.endswith(exe.split('/')[-1]) and not path.endswith('.so'): return ip   # non-PIE executable
+    return to_vaddr(path, ip - m[0] + m[2])
 count = collections.Counter()
 for ip in ips:
     m = next((m for m in maps if m[0] <= ip < m[1]), None)
     if not m: count['?'] += 1; continue
     path = m[3]
-    off = ip if path.endswith(exe.split('/')[-1]) else ip - m[0] + m[2]
+    off = offset_of(ip, m)
     addrs, names = syms(path)
     i = bisect.bisect_right(addrs, off) - 1
     lib = path.split('/')[-1]
@@ -49,7 +67,7 @@ def name_of(ip):
     m = next((m for m in maps if m[0] <= ip < m[1]), None)
     if not m: return None, '?'
     path = m[3]
-    off = ip if path.endswith(exe.split('/')[-1]) else ip - m[0] + m[2]
+    off = offset_of(ip, m)
     addrs, names = syms(path)
     i = bisect.bisect_right(addrs, off) - 1
     return path, (names[i] if i >= 0 else hex(off))

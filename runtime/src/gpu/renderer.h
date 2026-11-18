@@ -34,6 +34,8 @@ void RendererSubmitPending();
 float RendererScale();
 // Request a new internal resolution multiplier (1..4); applied at the next frame boundary.
 void RendererSetScale(float scale);
+// shadow map quality: 1 high (full resolution always), 0 low (half); applied at the next frame
+void RendererSetShadowQuality(int q);
 // BO3_AB_TOGGLE=n: flips every n stats windows (120 frames) so a change can be measured against
 // the old path in the same run and scene (code under test checks it; logged with the stats).
 extern bool g_ab;

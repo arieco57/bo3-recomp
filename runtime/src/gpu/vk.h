@@ -34,20 +34,36 @@ struct VkCtx
     VkDeviceMemory guestMemory = VK_NULL_HANDLE;
     VkBuffer guestBuffer = VK_NULL_HANDLE;
     VkDeviceSize guestSize = 0;
+    uint8_t* guestCopy = nullptr;   // copy mode: the GPU's own copy of guest memory, mapped (nullptr = shared)
     bool hasDmaBuf = false;
     bool customDriver = false;
     bool hasHostImport = false;   // VK_EXT_external_memory_host
     bool hasAnisotropy = true;
+    bool hasGs = true;    // geometry shaders (Mali / PowerVR have none: rect / quad lists drawn by vertex shader variants)
+    bool hasBC = true;            // textureCompressionBC (Mali / PowerVR lack it: DXT decoded on the CPU)
+    bool hasAhb = false;
+          // VK_ANDROID_external_memory_android_hardware_buffer
     bool hasPlacedMap = false;   // VK_EXT_map_memory_placed   // Android: Turnip loaded through libadrenotools
 
     bool hasVrs = false;   // VK_KHR_fragment_shading_rate (pipeline rate): MSAA-like shading of sample-space targets
     PFN_vkCmdSetFragmentShadingRateKHR cmdSetFragmentShadingRate = nullptr;
     bool hasStencilExport = false;
+    // Vulkan 1.3 features that older drivers (Vulkan 1.1 / 1.2: Adreno stock drivers of Android 11-13,
+    // Mali r2x...) lack: each one has a fallback (render passes, static pipeline state, classic barriers)
+    bool hasDynRendering = true;   // VK_KHR_dynamic_rendering
+    bool hasSync2 = true;          // VK_KHR_synchronization2
+    bool hasEds = true;            // VK_EXT_extended_dynamic_state
+    bool hasFloatControls = true;  // SignedZeroInfNanPreserve (fp32): the Xenos math emulation's inf / nan tests
     float maxAnisotropy = 1.0f;
     VkPipelineCache pipelineCache = VK_NULL_HANDLE;   // persisted in shadercache/pipelines.bin
 };
 
 extern VkCtx g_vk;
+
+// vkCmdPipelineBarrier2, or the classic barrier on drivers without synchronization2
+void VkCmdBarrier2(VkCommandBuffer cmd, const VkDependencyInfo* di);
+// copy mode: GPU writes of [off, off + n) visible to the CPU mapping (non-coherent memory)
+void VkGuestCopyInvalidate(uint32_t off, uint32_t n);
 
 // Main thread: create the window (must happen before the guest starts).
 void VkCreateWindow(const char* title, int width, int height);
@@ -55,6 +71,11 @@ void VkCreateWindow(const char* title, int width, int height);
 void VkInit();                 // instance, device, swapchain (idempotent)
 int VkExportGuestMemory();     // guest physical memory as an exported dma-buf fd, or -1
 void VkImportGuestMemory();    // fallback: import host memory at guest 0xA0000000
+// Android, any driver: guest physical memory as an AHardwareBuffer (BLOB) imported into Vulkan;
+// its dma-buf fd for MemoryInit, or -1.
+int VkAhbGuestMemory();
+// Android: gpu_state file for the launcher ("starting" / "ok" + driver)
+void VkWriteGpuState(const char* state);
 // Android (KGSL): guest memory allocated cached + IO-coherent and mapped by the driver at the three
 // physical views (VK_EXT_map_memory_placed + the same KGSL object mapped twice more). After
 // MemoryInit(kPhysExternal). False if not supported.
