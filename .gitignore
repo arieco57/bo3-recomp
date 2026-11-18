@@ -43,3 +43,8 @@ shot.txt
 dist/
 release.conf
 tools/cache/
+
+# Separate project (Raft, Unity) - local only, contains game files
+Raft Recomp/
+Forest Recomp/
+phone-backup-*/

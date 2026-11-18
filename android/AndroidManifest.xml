@@ -27,6 +27,24 @@
 
         <meta-data android:name="SDL_ENV.SDL_ANDROID_TRAP_BACK_BUTTON" android:value="0"/>
 
+        <!-- first run: the player picks disc image, Title Update and Compatibility Packs 1 and 2 (no storage permission) -->
+        <activity android:name="com.bo3recomp.InstallerActivity"
+            android:label="BO3 Recomp - instalación"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false" />
+
+        <!-- video driver choice: launcher shortcut (long press on the icon) or after a run without picture -->
+        <activity android:name="com.bo3recomp.DriverActivity"
+            android:label="Driver de video"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:taskAffinity="com.bo3recomp.driver"
+            android:excludeFromRecents="true"
+            android:exported="true" />
+
+        <!-- error reports to our backend (LogUpload), from the main process -->
+        <service android:name="com.bo3recomp.LogUploadService" android:exported="false" />
+
         <activity android:name="com.bo3recomp.ZombiesActivity"
             android:label="BO3 Zombies"
             android:icon="@mipmap/ic_zm"
@@ -41,6 +59,7 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts_zm" />
         </activity>
 
         <activity android:name="com.bo3recomp.MultiplayerActivity"
@@ -57,6 +76,7 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts_mp" />
         </activity>
     </application>
 </manifest>

@@ -81,6 +81,18 @@ find_package(Vulkan REQUIRED)
 # Runtime (host side of the port). Compiled once per executable because it uses that
 # executable's ppc_config.h (image/code layout for the function table).
 file(GLOB RUNTIME_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/runtime/src/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/runtime/src/gpu/*.cpp)
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "setup_jni\\.cpp$")   # Android installer library only (below)
+# zstd decoder (the .zar disc images, runtime/src/zar.cpp), static on every platform (the Linux
+# AppImage needs only glibc): thirdparty/zstd (tools/fetch_deps.sh)
+set(ZSTD_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/zstd/lib)
+if(NOT EXISTS ${ZSTD_ROOT}/zstd.h)
+    message(FATAL_ERROR "zstd source not found in thirdparty/zstd: run tools/fetch_deps.sh")
+endif()
+file(GLOB ZSTD_SOURCES ${ZSTD_ROOT}/common/*.c ${ZSTD_ROOT}/decompress/*.c)
+add_library(zstd_static STATIC ${ZSTD_SOURCES})
+target_compile_definitions(zstd_static PRIVATE ZSTD_DISABLE_ASM)
+target_include_directories(zstd_static PUBLIC ${ZSTD_ROOT})
+set(ZSTD_LIB zstd_static)
 if(ANDROID)
     # XenonUtils (xex loader) from source: the prebuilt libraries are the desktop's.
     set(XU ${XENONRECOMP_ROOT}/XenonUtils)
@@ -91,6 +103,12 @@ if(ANDROID)
     target_include_directories(XenonUtilsAndroid PUBLIC ${XU} ${SIMDE_INCLUDE} ${XT}/disasm
         PRIVATE ${XT}/libmspack/libmspack/mspack ${XT}/tiny-AES-c ${XT}/TinySHA1)
     set(XENONUTILS_LIBS XenonUtilsAndroid)
+    # installer library: the first-run installation without the game, for com.bo3recomp.InstallerActivity
+    # (the player picks disc image, Title Update and Compatibility Packs 1 and 2; runtime/src/setup_jni.cpp)
+    add_library(bo3_setup SHARED ${CMAKE_CURRENT_SOURCE_DIR}/runtime/src/setup.cpp ${CMAKE_CURRENT_SOURCE_DIR}/runtime/src/zar.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/runtime/src/setup_jni.cpp)
+    target_include_directories(bo3_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime/src ${XU} ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/SDL3/include)
+    target_link_libraries(bo3_setup PRIVATE XenonUtilsAndroid zstd_static log z)
     # libadrenotools (BSD-2): loads Turnip (tools/build_turnip_android.sh) instead of the stock driver.
     # Its hook libraries go into the APK next to the game library.
     add_subdirectory(thirdparty/libadrenotools EXCLUDE_FROM_ALL)
@@ -115,11 +133,6 @@ else()
         set(AVCODEC_LIB ${FFMPEG_DESKTOP}/lib/libavcodec.a)
         set(AVUTIL_LIB ${FFMPEG_DESKTOP}/lib/libavutil.a m pthread)
         message(STATUS "FFmpeg: static xma2-only build in thirdparty/ffmpeg-desktop")
-    endif()
-    # zstd: the .zar disc images (runtime/src/zar.cpp)
-    find_library(ZSTD_LIB NAMES zstd libzstd.so.1 PATHS /usr/lib64 /usr/lib)
-    if(NOT ZSTD_LIB)
-        message(FATAL_ERROR "libzstd not found (needed for .zar disc images)")
     endif()
     find_library(AVCODEC_LIB NAMES avcodec libavcodec.so.61 PATHS /usr/lib64 /usr/lib)
     find_library(AVUTIL_LIB NAMES avutil libavutil.so.59 PATHS /usr/lib64 /usr/lib)
@@ -148,6 +161,7 @@ function(bo3_add_game target lib kind)
         ${CMAKE_CURRENT_SOURCE_DIR}/runtime/xenia
         ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/glslang
         ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/volk
+        ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/stb
         $<$<BOOL:${ANDROID}>:${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/Vulkan-Headers/include>
         ${Vulkan_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/ffmpeg-src)
@@ -160,7 +174,7 @@ function(bo3_add_game target lib kind)
         glslang::glslang-default-resource-limits glslang::SPIRV ${AVCODEC_LIB} ${AVUTIL_LIB} ${ZSTD_LIB} ${CMAKE_DL_LIBS})
     if(ANDROID)
         target_compile_definitions(${target} PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
-        target_link_libraries(${target} PRIVATE log android adrenotools)
+        target_link_libraries(${target} PRIVATE log android nativewindow adrenotools)
         add_dependencies(${target} main_hook file_redirect_hook gsl_alloc_hook hook_impl)
     else()
         target_link_libraries(${target} PRIVATE pthread)

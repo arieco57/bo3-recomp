@@ -33,6 +33,18 @@ static std::string ConfigDefault(const std::string& key)
     return {};
 }
 
+#ifdef __ANDROID__
+#include <jni.h>
+// com.bo3recomp.LogUpload: the backend compiled into this build (bo3recomp.ini is read by Java)
+extern "C" JNIEXPORT jstring JNICALL Java_com_bo3recomp_LogUpload_defaultConfig(JNIEnv* env, jclass, jstring key)
+{
+    const char* k = env->GetStringUTFChars(key, nullptr);
+    std::string v = ConfigDefault(k ? k : "");
+    if (k) env->ReleaseStringUTFChars(key, k);
+    return env->NewStringUTF(v.c_str());
+}
+#endif
+
 std::string ConfigValue(const char* key)
 {
     std::string want = std::string(key) + "=", out;

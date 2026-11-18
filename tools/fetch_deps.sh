@@ -15,6 +15,7 @@ clone thirdparty/SDL3 https://github.com/libsdl-org/SDL.git a8589a8
 clone thirdparty/glslang https://github.com/KhronosGroup/glslang.git 83f75db
 clone thirdparty/Vulkan-Headers https://github.com/KhronosGroup/Vulkan-Headers.git 88487f6
 clone thirdparty/volk https://github.com/zeux/volk.git b8f91c0
+clone thirdparty/stb https://github.com/nothings/stb.git 9600522   # stb_truetype: the Linux installer window's text
 clone thirdparty/libadrenotools https://github.com/bylaws/libadrenotools.git 8fae8ce
 git -C thirdparty/libadrenotools submodule update --init --recursive -q
 # FFmpeg 7.1.1: headers for the runtime (thirdparty/ffmpeg-src) + static xma2-only libraries
@@ -26,4 +27,9 @@ if [ ! -d thirdparty/ffmpeg-src/libavcodec ]; then
     cp -r thirdparty/ffmpeg-desktop-build/ffmpeg-7.1.1/libavcodec thirdparty/ffmpeg-desktop-build/ffmpeg-7.1.1/libavutil thirdparty/ffmpeg-src/
 fi
 [ -f thirdparty/ffmpeg-desktop/lib/libavcodec.a ] || tools/build_ffmpeg_desktop.sh
+# zstd 1.5.7 source: the .zar disc image decoder (static on Linux and Android)
+if [ ! -f thirdparty/zstd/lib/zstd.h ]; then
+    curl -L -o thirdparty/zstd-1.5.7.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+    tar xzf thirdparty/zstd-1.5.7.tar.gz -C thirdparty && mv thirdparty/zstd-1.5.7 thirdparty/zstd && rm thirdparty/zstd-1.5.7.tar.gz
+fi
 echo "Dependencies ready. Next: tools/prepare.sh (needs your own copy of the game), then cmake."

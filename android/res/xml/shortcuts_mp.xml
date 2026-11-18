@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut android:shortcutId="driver" android:enabled="true" android:icon="@mipmap/ic_mp"
+        android:shortcutShortLabel="@string/driver_short" android:shortcutLongLabel="@string/driver_long">
+        <intent android:action="android.intent.action.VIEW" android:targetPackage="com.bo3recomp"
+            android:targetClass="com.bo3recomp.DriverActivity" />
+    </shortcut>
+</shortcuts>

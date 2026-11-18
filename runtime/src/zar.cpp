@@ -4,7 +4,7 @@
 //   [offset records: { u64 baseOffset; u16 sizeMinus1[16]; } per 16 blocks]
 //   [names table] [file tree: 16-byte entries] [footer: 6 x {u64 offset,u64 size}, u8 sha256[32],
 //    u64 totalSize, u32 version, u32 magic]
-// All integers are big-endian. Desktop only (zstd is the system library); Android has no .zar input.
+// All integers are big-endian. zstd: the system library on Linux, thirdparty/zstd (decoder only) on Android.
 #include "zar.h"
 
 #include <cstdint>
@@ -17,9 +17,42 @@
 #include <string>
 #include <vector>
 
-#ifndef __ANDROID__
 #include <zstd.h>
-#endif
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace
+{
+int ProcFdWithoutProc(const char* p)   // N for "/proc/self/fd/N" when that path cannot be opened, else -1
+{
+    int n;
+    char extra;
+    if (sscanf(p, "/proc/self/fd/%d%c", &n, &extra) != 1 || n < 0) return -1;
+    return access(p, F_OK) == 0 ? -1 : n;
+}
+}
+
+FILE* FopenInput(const char* path, const char* mode)
+{
+    int n = mode[0] == 'r' && !strchr(mode, '+') ? ProcFdWithoutProc(path) : -1;
+    if (n < 0) return fopen(path, mode);
+    int d = dup(n);
+    if (d < 0) return nullptr;
+    FILE* f = fdopen(d, "rb");
+    if (!f) { close(d); return nullptr; }
+    fseeko(f, 0, SEEK_SET);   // (the descriptor's offset is shared with the other copies)
+    return f;
+}
+
+bool InputStat(const std::string& path, uint64_t& size, bool& isDir)
+{
+    struct stat st;
+    int n = ProcFdWithoutProc(path.c_str());
+    if (n >= 0 ? fstat(n, &st) != 0 : stat(path.c_str(), &st) != 0) return false;
+    size = uint64_t(st.st_size);
+    isDir = S_ISDIR(st.st_mode);
+    return true;
+}
 
 namespace fs = std::filesystem;
 
@@ -74,14 +107,10 @@ struct Reader
         if (csize == kBlock) data = raw;
         else
         {
-#ifndef __ANDROID__
             data.resize(kBlock);
             size_t n = ZSTD_decompress(data.data(), kBlock, raw.data(), raw.size());
             if (ZSTD_isError(n)) return false;
             data.resize(n);
-#else
-            return false;
-#endif
         }
         cache = data;
         cacheIdx = int64_t(idx);
@@ -142,7 +171,7 @@ struct Walker
 
 bool ZarIsArchive(const std::string& path)
 {
-    FILE* f = fopen(path.c_str(), "rb");
+    FILE* f = FopenInput(path.c_str(), "rb");
     if (!f) return false;
     uint8_t ft[kFooterSize];
     bool ok = fseeko(f, -off_t(kFooterSize), SEEK_END) == 0 && fread(ft, 1, sizeof(ft), f) == sizeof(ft);
@@ -152,12 +181,8 @@ bool ZarIsArchive(const std::string& path)
 
 bool ZarExtract(const std::string& path, const std::string& outDir, std::string& err, std::function<void(uint64_t, uint64_t)> progress)
 {
-#ifdef __ANDROID__
-    err = "los archivos .zar no se soportan en Android (usá la imagen .iso o instalá desde Linux)";
-    return false;
-#else
     Reader r;
-    r.f = fopen(path.c_str(), "rb");
+    r.f = FopenInput(path.c_str(), "rb");
     if (!r.f) { err = "no se pudo abrir " + path; return false; }
     struct Close { FILE* f; ~Close() { fclose(f); } } closer{ r.f };
     fseeko(r.f, 0, SEEK_END);
@@ -198,5 +223,4 @@ bool ZarExtract(const std::string& path, const std::string& outDir, std::string&
     Walker w{ r, outDir, [&](const std::string&, uint64_t n) { done += n; if (progress) progress(done, total); }, {} };
     if (!w.Walk(0, "")) { err = w.err; return false; }
     return true;
-#endif
 }

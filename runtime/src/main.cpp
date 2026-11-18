@@ -59,8 +59,14 @@ void ImportUnimplemented(PPCContext& ctx, const char* name)
 // Indirect call (bctrl / bctr) to an address that is not a recompiled function start.
 static PPC_FUNC(UnknownIndirectCall)
 {
+#ifdef PPC_CONFIG_CTR_AS_LOCAL
+    // (CTR is a local of the calling function: the target address is not visible here)
+    Fatal("indirect call to an address that is not a known function start (lr=0x%08X) - "
+          "add it to the config's functions list", uint32_t(ctx.lr));
+#else
     Fatal("indirect call to 0x%08X, which is not a known function start (lr=0x%08X) - "
           "add it to the config's functions list", ctx.ctr.u32, uint32_t(ctx.lr));
+#endif
 }
 
 static void OnCrash(int sig, siginfo_t* info, void* uctx)
@@ -71,6 +77,20 @@ static void OnCrash(int sig, siginfo_t* info, void* uctx)
     if (sig == SIGSEGV && WatchHandleFault(info->si_addr)) return;
     uintptr_t fault = (uintptr_t)info->si_addr;
     GuestThread* t = CurrentThread();
+#ifdef __ANDROID__
+    // stderr goes nowhere on Android: the crash into the log too, and last_crash for the launcher
+    // (com.bo3recomp.GameStart sends the log at the next start). We are going down anyway.
+    {
+        char what[256];
+        if (fault >= (uintptr_t)g_base && fault < (uintptr_t)g_base + 0x100000000ull)
+            snprintf(what, sizeof(what), "signal %d: guest memory access at 0x%08X (thread %u)", sig, uint32_t(fault - (uintptr_t)g_base), t ? t->id : 0);
+        else
+            snprintf(what, sizeof(what), "signal %d at host address %p (thread %u)", sig, info->si_addr, t ? t->id : 0);
+        LogError("*** crash: %s", what);
+        if (t && t->ctx) LogError("    guest backtrace: %s", GuestBacktrace(*t->ctx).c_str());
+        if (FILE* cf = fopen("last_crash", "w")) { fprintf(cf, "%s\n", what); fclose(cf); }
+    }
+#endif
     if (fault >= (uintptr_t)g_base && fault < (uintptr_t)g_base + 0x100000000ull)
         fprintf(stderr, "\n*** signal %d: guest memory access at 0x%08X (thread %u)\n", sig,
                 uint32_t(fault - (uintptr_t)g_base), t ? t->id : 0);
@@ -170,9 +190,18 @@ int main(int argc, char** argv)
     sigaction(SIGILL, &sa, nullptr);
     sigaction(SIGTRAP, &sa, nullptr);
     sigaction(SIGFPE, &sa, nullptr);
+#ifdef __ANDROID__
+    sigaction(SIGABRT, &sa, nullptr);   // Fatal(): marked as a crash for the log upload
+#endif
 
     Log("BO3 Recomp runtime (%s)", BO3_EXE_KIND);
     const bool windowed = !getenv("BO3_NO_WINDOW");
+#ifndef __ANDROID__
+    // first run (Linux): the installer window, where the player picks the files of their copy
+    // (not when everything missing is already in "instalar/": that installs by itself below)
+    if (windowed && !SetupInstalled() && !(getenv("BO3_SETUP_YES") && *getenv("BO3_SETUP_YES") == '1') && !SetupLocalComplete())
+        if (InstallerUiRun(BO3_EXE_KIND[0] == 'z') == 0) return 0;
+#endif
     if (windowed)
     {
         // Vulkan first: guest physical memory is allocated by the GPU driver (dma-buf) so the
@@ -196,11 +225,23 @@ int main(int argc, char** argv)
 #ifdef __ANDROID__
             // KGSL dma-buf mmaps come out uncached and fault on atomics: import cached CPU memory
             // instead when the driver can (our Turnip build adds VK_EXT_external_memory_host).
-            if (g_vk.hasHostImport && !getenv("BO3_DMABUF")) preferHost = true;
+            if (g_vk.hasHostImport && !getenv("BO3_DMABUF") && !getenv("BO3_AHB")) preferHost = true;   // (BO3_AHB=1: test the stock-driver path)
 #endif
-            int fd = preferHost ? -1 : VkExportGuestMemory();
+            int fd = -1;
+#ifdef __ANDROID__
+            // the phone's own driver (Mali, Adreno stock...): an AHardwareBuffer, any driver has it
+            if (!preferHost && !getenv("BO3_DMABUF")) fd = VkAhbGuestMemory();
+#endif
+            if (fd < 0 && !preferHost) fd = VkExportGuestMemory();
+            if (fd < 0 && !g_vk.hasHostImport) Log("vk: no dma-buf / AHardwareBuffer for guest memory");
             MemoryInit(fd);
-            if (fd < 0) VkImportGuestMemory();
+            if (fd < 0)
+            {
+                VkImportGuestMemory();
+#ifdef __ANDROID__
+                WatchEnableGpuFlush();   // (KGSL user memory: IO-coherent only on newer kernels)
+#endif
+            }
 #ifdef __ANDROID__
             MemoryDiagnose();
 #endif

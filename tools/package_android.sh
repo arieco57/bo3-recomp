@@ -19,7 +19,7 @@ javac --release 17 -nowarn -classpath "$JAR" -d "$OUT/classes" "${SRCS[@]}" 2>&1
 mapfile -d '' CLASSES < <(find "$OUT/classes" -name '*.class' -print0)
 "$BT/d8" --release --min-api 29 --lib "$JAR" --output "$OUT/dex" "${CLASSES[@]}"
 
-for so in libbo3_zm.so libbo3_mp.so; do
+for so in libbo3_zm.so libbo3_mp.so libbo3_setup.so; do
     [ -f "$ROOT/build-android/$so" ] && cp "$ROOT/build-android/$so" "$OUT/lib/arm64-v8a/"
 done
 cp "$ROOT/thirdparty/ffmpeg-android/lib/libavcodec.so" "$ROOT/thirdparty/ffmpeg-android/lib/libavutil.so" "$OUT/lib/arm64-v8a/"

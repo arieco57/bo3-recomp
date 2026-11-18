@@ -18,6 +18,7 @@
 #include <xex_patcher.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -25,6 +26,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <string>
 #include <chrono>
 #include <thread>
@@ -105,7 +107,7 @@ struct Sha1
 
 std::string FileSha1(const std::string& path)
 {
-    FILE* f = fopen(path.c_str(), "rb");
+    FILE* f = FopenInput(path.c_str(), "rb");
     if (!f) return {};
     Sha1 s;
     std::vector<uint8_t> b(1 << 20);
@@ -117,7 +119,7 @@ std::string FileSha1(const std::string& path)
 
 bool ReadFileBytes(const std::string& path, std::vector<uint8_t>& out)
 {
-    FILE* f = fopen(path.c_str(), "rb");
+    FILE* f = FopenInput(path.c_str(), "rb");
     if (!f) return false;
     fseeko(f, 0, SEEK_END);
     off_t n = ftello(f);
@@ -226,7 +228,7 @@ struct Stfs
 
     bool Open(const std::string& path)
     {
-        f = fopen(path.c_str(), "rb");
+        f = FopenInput(path.c_str(), "rb");
         if (!f) return false;
         uint8_t h[0x500];
         if (fread(h, 1, sizeof(h), f) != sizeof(h)) return false;
@@ -351,14 +353,79 @@ std::vector<std::string> InputDirs()
 }
 
 // Puts one file in the list of its kind (disc image, Title Update, DLC); other files are ignored.
-void Classify(Inputs& in, const std::string& p)
+// Already extracted content folders (Xenia's layout) work too: a Title Update folder (it has
+// default.xexp), DLC folders (console names: 40 hex digits + "41"), or a parent of those
+// (000B0000, 00000002, 4156091D...) - looked through a few levels down.
+const char* kCp1 = "A92CACF8DF6D9DB1C32970035A6B8B63B09C2F1641";
+const char* kCp2 = "4FD64D1A99FF002F54CEE0FE922808E1D2D21A5341";
+bool IsContentName(const std::string& n)
+{
+    if (n.size() != 42) return false;
+    for (char c : n) if (!isxdigit((unsigned char)c)) return false;
+    return true;
+}
+
+void Classify(Inputs& in, const std::string& p);
+void ClassifyDir(Inputs& in, const fs::path& d, int depth)
 {
     std::error_code ec;
-    if (!fs::is_regular_file(p, ec) || fs::file_size(p, ec) < 0x1000) return;
-    FILE* f = fopen(p.c_str(), "rb");
+    if (fs::exists(d / "default.xexp", ec) || fs::exists(d / "default_zm.xexp", ec)) { in.updates.push_back(d.string()); return; }
+    if (IsContentName(d.filename().string())) { in.dlcs.push_back(d.string()); return; }
+    if (depth <= 0) return;
+    for (auto& e : fs::directory_iterator(d, ec))
+    {
+        if (e.is_directory(ec)) ClassifyDir(in, e.path(), depth - 1);
+        else if (e.is_regular_file(ec)) Classify(in, e.path().string());   // packages (STFS) or a disc image inside
+    }
+}
+
+bool IsDir(const std::string& p) { uint64_t size; bool dir; return InputStat(p, size, dir) && dir; }
+
+// display name of a DLC input (STFS header, or the known name of a Compatibility Pack folder)
+std::string DlcDisplay(const std::string& p)
+{
+    if (IsDir(p))
+    {
+        std::string n = fs::path(p).filename().string();
+        return n == kCp1 ? "Compatibility Pack 1" : n == kCp2 ? "Compatibility Pack 2" : n;
+    }
+    Stfs s;
+    std::string name;
+    if (s.Open(p)) for (char16_t c : s.displayName) if (c < 128) name += char(c);
+    return name;
+}
+
+// a folder input: moved when it is our own copy (the installer screen copies picked folders into
+// "instalar-carpetas" of the data folder), copied otherwise (the player's folders stay as they are)
+bool PlaceDir(const std::string& src, const std::string& dst, std::string& err)
+{
+    std::error_code ec;
+    fs::remove_all(dst + ".part", ec);
+    fs::create_directories(fs::path(dst).parent_path(), ec);
+    std::string rel = fs::relative(src, fs::current_path(), ec).string();
+    if (!ec && rel.rfind("instalar-carpetas", 0) == 0)
+    {
+        fs::rename(src, dst, ec);
+        if (!ec) return true;
+    }
+    fs::copy(src, dst + ".part", fs::copy_options::recursive, ec);
+    if (ec) { err = ec.message(); fs::remove_all(dst + ".part", ec); return false; }
+    fs::rename(dst + ".part", dst, ec);
+    if (ec) { err = ec.message(); return false; }
+    return true;
+}
+
+void Classify(Inputs& in, const std::string& p)
+{
+    uint64_t size;
+    bool dir;
+    if (!InputStat(p, size, dir)) return;
+    if (dir) { ClassifyDir(in, p, 3); return; }
+    if (size < 0x1000) return;
+    FILE* f = FopenInput(p.c_str(), "rb");
     if (!f) return;
     uint64_t base;
-    bool big = fs::file_size(p, ec) > (64ull << 20);
+    bool big = size > (64ull << 20);
     bool disc = big && (DiscPartition(f, base) || ZarIsArchive(p));
     fclose(f);
     if (disc) { in.discs.push_back(p); return; }
@@ -381,7 +448,13 @@ Inputs FindInputs()
 }
 
 bool GameOk() { return Exists(std::string(kGameDir) + "/default.xex") && Exists(std::string(kGameDir) + "/default_zm.xex"); }
-bool TuOk() { return Exists(std::string(kTuDir) + "/default.xexp") && Exists(std::string(kTuDir) + "/default_zm.xexp"); }
+// the supported Title Update in place (by SHA-1: a wrong one left by an earlier attempt counts as missing)
+bool TuOk()
+{
+    for (auto& x : kExes)
+        if (!Exists(std::string(kTuDir) + "/" + x.xexp) || FileSha1(std::string(kTuDir) + "/" + x.xexp) != x.xexpSha) return false;
+    return true;
+}
 bool PatchedOk() { for (auto& x : kExes) if (!Exists(std::string("private/") + x.kind + "/default_patched.xex")) return false; return true; }
 
 const char* kHowTo =
@@ -402,19 +475,28 @@ int CountDlcNamed(const Inputs& in, const std::string& needle)
 {
     int n = 0;
     for (auto& p : in.dlcs)
-    {
-        Stfs s;
-        if (!s.Open(p)) continue;
-        std::string name;
-        for (char16_t c : s.displayName) if (c < 128) name += char(c);
-        if (name.find(needle) != std::string::npos) n++;
-    }
+        if (DlcDisplay(p).find(needle) != std::string::npos) n++;
     return n;
+}
+
+// Android installer screen (InstallerActivity -> setup_jni.cpp): status/progress go to it, no dialogs
+SetupReport g_report = nullptr;
+// display names of explicitly chosen files (they arrive as /proc/self/fd/N paths)
+std::map<std::string, std::string> g_names;
+std::string NameOf(const std::string& p) { auto it = g_names.find(p); return it != g_names.end() ? it->second : fs::path(p).filename().string(); }
+
+void Report(int pct, const std::string& text)
+{
+    static int last = -1;
+    if (pct / 5 != last / 5 || pct < 0) Log("setup: %s (%d%%)", text.c_str(), pct);
+    last = pct;
+    if (g_report) g_report(text.c_str(), pct);
 }
 
 // BO3_SETUP_YES=1: no dialogs (automated tests); the messages still go to the log
 void Tell(const std::string& text)
 {
+    if (g_report) { Log("setup: %s", text.c_str()); g_report(text.c_str(), -1); return; }
     static const bool quiet = getenv("BO3_SETUP_YES") && *getenv("BO3_SETUP_YES") == '1';
     if (quiet) { Log("setup: %s", text.c_str()); return; }
     UiMessage("BO3 Recomp - instalación", text);
@@ -529,6 +611,8 @@ bool RunWizard(Inputs& in)
 }
 #endif
 
+bool Install(Inputs& in);
+
 bool SetupGameData()
 {
     if (GameOk() && TuOk() && PatchedOk()) return true;
@@ -566,14 +650,21 @@ bool SetupGameData()
         Log("setup: %zu disc image(s), %zu title update(s), %zu DLC package(s) after the wizard", in.discs.size(), in.updates.size(), in.dlcs.size());
     }
 #endif
+    return Install(in);
+}
+
+// The installation itself, from the inputs found or chosen.
+bool Install(Inputs& in)
+{
     if (!GameOk() && in.discs.empty()) return Fail(std::string("No se encontró la imagen del disco (.zar o .iso).\n\n") + kHowTo);
     if (!TuOk() && in.updates.empty()) return Fail(std::string("No se encontró el Title Update del juego.\n\n") + kHowTo);
 
     std::string what;
-    if (!GameOk()) what += "\n- disco: " + fs::path(in.discs[0]).filename().string();
-    if (!TuOk()) what += "\n- Title Update: " + fs::path(in.updates[0]).filename().string();
+    if (!GameOk()) what += "\n- disco: " + NameOf(in.discs[0]);
+    if (!TuOk()) what += "\n- Title Update: " + NameOf(in.updates[0]);
     if (!in.dlcs.empty()) what += "\n- " + std::to_string(in.dlcs.size()) + " DLC";
-    Tell("Se va a instalar el juego desde tu copia:" + what +
+    if (g_report) Report(0, "Instalando desde tu copia:" + what);
+    else Tell("Se va a instalar el juego desde tu copia:" + what +
                   "\n\nTarda unos minutos (en el teléfono, hasta 15-20). La pantalla queda quieta mientras tanto: no cierres la app."
                   "\nHacen falta unos 8 GB libres; después podés borrar los archivos originales.");
 
@@ -589,7 +680,7 @@ bool SetupGameData()
         int lastPct = -1;
         bool ok = ZarExtract(in.discs[0], tmp, err, [&](uint64_t done, uint64_t total) {
             int pct = total ? int(done * 100 / total) : 100;
-            if (pct / 10 != lastPct / 10) { lastPct = pct; Log("setup: disc %d%%", pct); }
+            if (pct != lastPct) { lastPct = pct; Report(pct * 80 / 100, "Extrayendo el disco: " + std::to_string(pct) + "%"); }
         });
         if (!ok) { fs::remove_all(tmp, ec); return Fail("No se pudo extraer la imagen del disco (.zar): " + err + "\n\nSi dice \"Disk quota\" o \"No space\", falta espacio libre: hacen falta unos 8 GB.");  }
         fs::remove_all(kGameDir, ec);
@@ -599,7 +690,7 @@ bool SetupGameData()
     else if (!GameOk())
     {
         discNow = true;
-        FILE* f = fopen(in.discs[0].c_str(), "rb");
+        FILE* f = FopenInput(in.discs[0].c_str(), "rb");
         uint64_t base;
         std::vector<DiscFile> files;
         if (!f || !DiscPartition(f, base) || !DiscList(f, base, files)) { if (f) fclose(f); return Fail("No se pudo leer la imagen del disco."); }
@@ -616,7 +707,7 @@ bool SetupGameData()
             if (!CopyRange(f, df.offset, df.size, tmp + "/" + df.path)) { fclose(f); return Fail("Error extrayendo " + df.path + " (¿espacio libre?)."); }
             done += df.size;
             int pct = total ? int(done * 100 / total) : 100;
-            if (pct / 10 != lastPct / 10) { lastPct = pct; Log("setup: disc %d%%", pct); }
+            if (pct != lastPct) { lastPct = pct; Report(pct * 80 / 100, "Extrayendo el disco: " + std::to_string(pct) + "%"); }
         }
         fclose(f);
         fs::create_directories(fs::path(kGameDir).parent_path(), ec);
@@ -632,8 +723,23 @@ bool SetupGameData()
                         "Black Ops III de Xbox 360 (la versión usada para el port)." + (discNow ? "" : " Borrá la carpeta extracted para instalar otra imagen."));
         }
 
-    // 2. the title update
-    if (!TuOk())
+    // 2. the title update. One already in place that is not the supported version (an earlier
+    // attempt with another TU) is replaced, or it would block every later attempt.
+    Report(82, "Instalando el Title Update");
+    if (!TuOk() && fs::exists(kTuDir))
+    {
+        std::error_code ec;
+        fs::remove_all(kTuDir, ec);
+        Log("setup: the installed title update is not the supported one - replaced");
+    }
+    if (!TuOk() && IsDir(in.updates[0]))
+    {
+        std::string err;
+        if (!PlaceDir(in.updates[0], kTuDir, err)) return Fail("No se pudo copiar la carpeta del Title Update: " + err);
+        WriteContentHeader("000B0000", "tu00000001_00000000", 0xB0000, u"Title Update 1");
+        Log("setup: title update installed (folder)");
+    }
+    else if (!TuOk())
     {
         Stfs s;
         std::string err, tmp = std::string(kTuDir) + ".part";
@@ -647,18 +753,41 @@ bool SetupGameData()
     }
     for (auto& x : kExes)
         if (FileSha1(std::string(kTuDir) + "/" + x.xexp) != x.xexpSha)
-            return Fail(std::string("El Title Update no es la versión soportada (") + x.xexp + " distinto). Hace falta el Title Update 1 de la "
-                        "versión de Xbox 360 (" + kTuDir + ").");
+        {
+            std::error_code ec;
+            fs::remove_all(kTuDir, ec);   // not kept: the next attempt installs the chosen one
+            return Fail(std::string("El Title Update no es la versión soportada (") + x.xexp + " distinto). Hace falta el Title Update "
+                        "\"TU 8\" de Xbox 360: un archivo tu00000001_00000000 de 116.740.096 bytes (SHA-1 "
+                        "5a0dae7c141baba68cb3bde8a93cd3ee4c7300f6).");
+        }
 
-    // 3. DLC (optional)
+    // 3. DLC (optional). The free Compatibility Packs get their console folder names whatever the
+    // file is called (a file chosen on the phone arrives without its original name).
+    Report(86, "Instalando los paquetes de contenido");
     for (auto& p : in.dlcs)
     {
-        std::string name = fs::path(p).filename().string(), dst = std::string(kDlcDir) + "/" + name;
-        if (Exists(dst)) continue;
+        if (IsDir(p))
+        {
+            std::string name = fs::path(p).filename().string(), dst = std::string(kDlcDir) + "/" + name, err, disp = DlcDisplay(p);
+            if (Exists(dst)) continue;
+            if (!PlaceDir(p, dst, err)) { LogWarn("setup: DLC folder %s skipped: %s", name.c_str(), err.c_str()); continue; }
+            std::u16string d16(disp.begin(), disp.end());
+            WriteContentHeader("00000002", name, 2, d16);
+            Log("setup: DLC %s installed (folder)", name.c_str());
+            continue;
+        }
         Stfs s;
         std::string err;
         std::error_code ec;
-        if (!s.Open(p) || !s.Extract(dst + ".part", err)) { LogWarn("setup: DLC %s skipped: %s", name.c_str(), err.c_str()); fs::remove_all(dst + ".part", ec); continue; }
+        if (!s.Open(p)) { LogWarn("setup: DLC %s unreadable", NameOf(p).c_str()); continue; }
+        std::string disp;
+        for (char16_t c : s.displayName) if (c < 128) disp += char(c);
+        std::string name = NameOf(p);
+        if (disp.find("Compatibility Pack 1") != std::string::npos) name = "A92CACF8DF6D9DB1C32970035A6B8B63B09C2F1641";
+        else if (disp.find("Compatibility Pack 2") != std::string::npos) name = "4FD64D1A99FF002F54CEE0FE922808E1D2D21A5341";
+        std::string dst = std::string(kDlcDir) + "/" + name;
+        if (Exists(dst)) continue;
+        if (!s.Extract(dst + ".part", err)) { LogWarn("setup: DLC %s skipped: %s", name.c_str(), err.c_str()); fs::remove_all(dst + ".part", ec); continue; }
         fs::rename(dst + ".part", dst, ec);
         WriteContentHeader("00000002", name, 2, s.displayName);
         Log("setup: DLC %s installed", name.c_str());
@@ -677,6 +806,7 @@ bool SetupGameData()
                     "\n\nCopialos desde Content/0000000000000000/4156091D/00000002/ de tu consola, junto al resto, y volvé a abrir el juego.");
 
     // 4. the executables with the title update applied
+    Report(92, "Aplicando el Title Update a los ejecutables");
     for (auto& x : kExes)
     {
         std::string out = std::string("private/") + x.kind + "/default_patched.xex";
@@ -690,8 +820,82 @@ bool SetupGameData()
         if (FileSha1(out) != x.patchedSha) return Fail(std::string("El ejecutable resultante no coincide (") + x.kind + ").");
         Log("setup: %s ready", out.c_str());
     }
-    Tell("Instalación terminada. Ya podés borrar la imagen del disco y los paquetes originales si querés.");
+    Report(100, "Instalación terminada");
+    if (!g_report) Tell("Instalación terminada. Ya podés borrar la imagen del disco y los paquetes originales si querés.");
     return true;
+}
+
+bool SetupInstalled()
+{
+    return GameOk() && TuOk() && PatchedOk() && Exists(std::string(kDlcDir) + "/A92CACF8DF6D9DB1C32970035A6B8B63B09C2F1641") &&
+           Exists(std::string(kDlcDir) + "/4FD64D1A99FF002F54CEE0FE922808E1D2D21A5341");
+}
+
+SetupProbe SetupProbePath(const std::string& path)
+{
+    Inputs in;
+    Classify(in, path);
+    SetupProbe r;
+    r.discs = int(in.discs.size());
+    r.updates = int(in.updates.size());
+    r.dlcs = int(in.dlcs.size());
+    for (auto& p : in.dlcs)
+    {
+        std::string n = DlcDisplay(p);
+        if (n.find("Compatibility Pack 1") != std::string::npos) r.cp1 = true;
+        if (n.find("Compatibility Pack 2") != std::string::npos) r.cp2 = true;
+    }
+    return r;
+}
+
+void SetupInstalledParts(bool out[4])
+{
+    out[0] = GameOk();
+    out[1] = TuOk();
+    out[2] = Exists(std::string(kDlcDir) + "/" + kCp1);
+    out[3] = Exists(std::string(kDlcDir) + "/" + kCp2);
+}
+
+bool SetupLocalComplete()
+{
+    bool part[4];
+    SetupInstalledParts(part);
+    if (part[0] && part[1] && part[2] && part[3]) return true;
+    Inputs in = FindInputs();
+    return (part[0] || !in.discs.empty()) && (part[1] || !in.updates.empty()) &&
+           (part[2] || CountDlcNamed(in, "Compatibility Pack 1") > 0) && (part[3] || CountDlcNamed(in, "Compatibility Pack 2") > 0);
+}
+
+// Android installer screen: the four files the player chose (disc image, Title Update, Compatibility
+// Pack 1 and 2), each { path, display name }; the current directory is the app's data folder.
+bool SetupGameDataFrom(const std::vector<std::pair<std::string, std::string>>& files, SetupReport report)
+{
+    g_report = report;
+    g_names.clear();
+    Inputs in;
+    for (auto& f : files)
+    {
+        g_names[f.first] = f.second;
+        size_t before = in.discs.size() + in.updates.size() + in.dlcs.size();
+        Classify(in, f.first);
+        if (in.discs.size() + in.updates.size() + in.dlcs.size() == before)
+        {
+            bool ok = Fail("\"" + f.second + "\" no es un archivo de Black Ops III para Xbox 360 (ni imagen de disco, ni Title Update, ni paquete de contenido).");
+            g_report = nullptr;
+            return ok;
+        }
+    }
+    Log("setup: chosen: %zu disc image(s), %zu title update(s), %zu DLC package(s)", in.discs.size(), in.updates.size(), in.dlcs.size());
+    bool ok;
+    if (in.discs.empty() && !GameOk()) ok = Fail("Falta la imagen del disco (.iso o .zar).");
+    else if (in.updates.empty() && !TuOk()) ok = Fail("Falta el Title Update.");
+    else if (!Exists(std::string(kDlcDir) + "/A92CACF8DF6D9DB1C32970035A6B8B63B09C2F1641") && CountDlcNamed(in, "Compatibility Pack 1") < 1)
+        ok = Fail("Falta el Compatibility Pack 1 (o el archivo elegido no es ese paquete).");
+    else if (!Exists(std::string(kDlcDir) + "/4FD64D1A99FF002F54CEE0FE922808E1D2D21A5341") && CountDlcNamed(in, "Compatibility Pack 2") < 1)
+        ok = Fail("Falta el Compatibility Pack 2 (o el archivo elegido no es ese paquete).");
+    else ok = Install(in);
+    g_report = nullptr;
+    return ok;
 }
 
 #ifdef __ANDROID__

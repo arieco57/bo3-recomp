@@ -7,12 +7,13 @@
 //   width=1920
 //   height=1080
 //   fullscreen=1
-//   render_scale=2
+//   render_scale=1
 // width/height = 0 means "native" (the desktop resolution): the size of the window / screen
-// mode. render_scale is the internal resolution the game is drawn at (1 = the console's
-// 1280x720, 2 = 2560x1440, 3 = 3840x2160).
+// mode. render_scale is the internal resolution the game is drawn at: 0.25, 0.35, 0.5, 0.75 or
+// 1 (the console's 1280x720, the maximum).
 #include "video_options.h"
 #include "gpu/renderer.h"
+#include "gpu/shader_translator.h"
 #include "host_input.h"
 #include "log.h"
 
@@ -37,13 +38,20 @@ struct VideoConfig
 {
     int width = 1280, height = 720;   // 0 = native
     bool fullscreen = false;
-    float renderScale = 1.0f;          // internal resolution: 1 = 1280x720 (console), 1.5 = 1920x1080, 2 = 2560x1440, 3 = 3840x2160
+    float renderScale = 1.0f;          // internal resolution: 0.25 / 0.35 / 0.5 / 0.75 / 1 (= 1280x720, console, the maximum)
     int fpsOverlay = 0;                // 0 off, 1 FPS, 2 detailed
     int fpsLimit = 60;                 // frame rate limit (the console runs at 60)
     float mouseSens = 1.0f;
     float mouseRatio = 2.0f;           // horizontal / vertical mouse sensitivity
     int fov = 0;                       // field of view (0 = game default)
     bool virtualPad = false;           // on-screen controller (Android)
+#ifdef __ANDROID__
+    int shadows = 0;                   // shadow quality: 1 high (full resolution always), 0 low (half: the phone default)
+    bool liteShaders = true;           // light shaders: plain float math (Adreno 618: main pass -29%; applies at the next start)
+#else
+    int shadows = 1;                   // shadow quality: 1 high (full resolution always), 0 low (half)
+    bool liteShaders = false;          // light shaders: plain float math (faster on weak GPUs; applies at the next start)
+#endif
     std::string gamertag, xuid, peers; // [network] (read by xam.cpp / net.cpp themselves; kept on save)
     std::string supaUrl, supaKey, email, password;   // [online] (cloud.cpp; kept on save)
 };
@@ -62,10 +70,12 @@ void Load()
         if (sscanf(line, "width=%d", &v) == 1) s_cfg.width = std::max(0, v);
         else if (sscanf(line, "height=%d", &v) == 1) s_cfg.height = std::max(0, v);
         else if (sscanf(line, "fullscreen=%d", &v) == 1) s_cfg.fullscreen = v != 0;
-        else if (float sv; sscanf(line, "render_scale=%f", &sv) == 1) s_cfg.renderScale = std::clamp(sv, 0.5f, 3.0f);
+        else if (float sv; sscanf(line, "render_scale=%f", &sv) == 1) s_cfg.renderScale = std::clamp(sv, 0.25f, 1.0f);   // (100% max: above the console resolution it adds nothing)
         else if (sscanf(line, "fps_overlay=%d", &v) == 1) s_cfg.fpsOverlay = std::clamp(v, 0, 2);
         else if (sscanf(line, "fps_limit=%d", &v) == 1) s_cfg.fpsLimit = std::clamp(v, 30, 480);
         else if (sscanf(line, "virtual_pad=%d", &v) == 1) s_cfg.virtualPad = v != 0;
+        else if (sscanf(line, "shadows=%d", &v) == 1) s_cfg.shadows = std::clamp(v, 0, 1);
+        else if (sscanf(line, "lite_shaders=%d", &v) == 1) s_cfg.liteShaders = v != 0;
         else if (sscanf(line, "fov=%d", &v) == 1) s_cfg.fov = v == 0 ? 0 : std::clamp(v, 55, 120);
         else if (float fv; sscanf(line, "mouse_sens=%f", &fv) == 1) s_cfg.mouseSens = std::clamp(fv, 0.05f, 10.0f);
         else if (float rv; sscanf(line, "mouse_ratio=%f", &rv) == 1) s_cfg.mouseRatio = std::clamp(rv, 0.25f, 4.0f);
@@ -108,12 +118,15 @@ void Save()
     FILE* f = fopen(kConfigPath, "w");
     if (!f) { LogWarn("options: can't write %s", kConfigPath); return; }
     fprintf(f, "# BO3 Recomp - video options (F1 in game)\n[video]\nwidth=%d\nheight=%d\nfullscreen=%d\n"
-               "# internal rendering resolution: 0.5 = 640x360, 1 = 1280x720 (console), 1.5 = 1920x1080, 2 = 2560x1440, 3 = 3840x2160\nrender_scale=%.4g\n"
+               "# internal rendering resolution: 0.25, 0.35, 0.5, 0.75 or 1 (= 1280x720, console, the maximum)\nrender_scale=%.4g\n"
                "# performance overlay: 0 off, 1 FPS, 2 detailed (F2 cycles)\nfps_overlay=%d\n"
-               "# frame rate limit 30..480 (the game speed does not depend on it)\nfps_limit=%d\n# field of view (0 = game default)\nfov=%d\n[input]\nmouse_sens=%.2f\n# horizontal / vertical mouse sensitivity\nmouse_ratio=%.2f\n"
+               "# frame rate limit 30..480 (the game speed does not depend on it)\nfps_limit=%d\n# field of view (0 = game default)\nfov=%d\n"
+               "# shadow quality: 1 high (full resolution at any internal resolution), 0 low (half: weak GPUs)\nshadows=%d\n"
+               "# light shaders: 1 = simpler float math, faster on weak GPUs / phones (rarely, a few black dots); next start\nlite_shaders=%d\n"
+               "[input]\nmouse_sens=%.2f\n# horizontal / vertical mouse sensitivity\nmouse_ratio=%.2f\n"
                "# on-screen controller (phone): 1 on, 0 off\nvirtual_pad=%d\n",
-            s_cfg.width, s_cfg.height, s_cfg.fullscreen ? 1 : 0, s_cfg.renderScale, s_cfg.fpsOverlay, s_cfg.fpsLimit, s_cfg.fov, s_cfg.mouseSens, s_cfg.mouseRatio,
-            s_cfg.virtualPad ? 1 : 0);
+            s_cfg.width, s_cfg.height, s_cfg.fullscreen ? 1 : 0, s_cfg.renderScale, s_cfg.fpsOverlay, s_cfg.fpsLimit, s_cfg.fov,
+            s_cfg.shadows, s_cfg.liteShaders ? 1 : 0, s_cfg.mouseSens, s_cfg.mouseRatio, s_cfg.virtualPad ? 1 : 0);
     if (!others.empty()) fputs(others.c_str(), f);
     else if (!s_cfg.gamertag.empty() || !s_cfg.xuid.empty() || !s_cfg.peers.empty())   // (first save of a file without them)
         fprintf(f, "[network]\ngamertag=%s\nxuid=%s\npeers=%s\n", s_cfg.gamertag.c_str(), s_cfg.xuid.c_str(), s_cfg.peers.c_str());
@@ -211,17 +224,50 @@ int Ask(SDL_Window* w, const std::string& title, const std::string& text, const 
 std::string ScaleName(float sc)
 {
     char b[64];
-    snprintf(b, sizeof(b), "%.2gx (%dx%d)", sc, int(1280 * sc + 0.5f), int(720 * sc + 0.5f));
+    snprintf(b, sizeof(b), "%d%% (%dx%d)", int(sc * 100 + 0.5f), int(1280 * sc + 0.5f), int(720 * sc + 0.5f));
     return b;
+}
+
+// the same choices in every port: 25 / 35 / 50 / 75 / 100 % (100% = 1280x720, the console's)
+const float kScales[] = { 0.25f, 0.35f, 0.5f, 0.75f, 1.0f };
+
+// shadows and light shaders
+void GraphicsDialog(SDL_Window* w)
+{
+    for (;;)
+    {
+        std::string text = std::string("Sombras: ") + (s_cfg.shadows ? "Altas" : "Bajas") +
+                           "\n  Altas: siempre a resolución completa, aunque bajes la resolución interna."
+                           "\n  Bajas: a la mitad (más FPS en GPUs débiles).\n\n"
+                           "Shaders: " + (s_cfg.liteShaders ? "Livianos" : "Normales") +
+                           "\n  Livianos: matemática simplificada, más rápida en GPUs débiles y teléfonos;"
+                           "\n  en algún efecto pueden aparecer puntos negros. Se aplica al reiniciar el juego.";
+        int id = Ask(w, "Gráficos", text,
+                     { std::string("Sombras: ") + (s_cfg.shadows ? "Altas" : "Bajas"), std::string("Shaders: ") + (s_cfg.liteShaders ? "Livianos" : "Normales"), "Volver" });
+        if (id == 0)
+        {
+            s_cfg.shadows = !s_cfg.shadows;
+            RendererSetShadowQuality(s_cfg.shadows);
+            Log("options: shadows %s", s_cfg.shadows ? "high" : "low");
+        }
+        else if (id == 1)
+        {
+            s_cfg.liteShaders = !s_cfg.liteShaders;
+            Log("options: %s shaders at the next start", s_cfg.liteShaders ? "light" : "normal");
+        }
+        else return;
+        Save();
+    }
 }
 
 void RenderScaleDialog(SDL_Window* w)
 {
-    static const float kScales[] = { 0.5f, 1.0f, 1.5f, 2.0f, 3.0f };
-    std::vector<std::string> buttons = { ScaleName(0.5f), ScaleName(1) + " consola", ScaleName(1.5f), ScaleName(2), ScaleName(3), "Volver" };
+    std::vector<std::string> buttons;
+    for (float sc : kScales) buttons.push_back(ScaleName(sc) + (sc == 1.0f ? " consola" : ""));
+    buttons.push_back("Volver");
     int id = Ask(w, "Resolución interna",
                  "Resolución interna actual: " + ScaleName(s_cfg.renderScale) +
-                     "\n\nEs la resolución a la que se dibuja el juego (más alta = más nítido, más carga de GPU)."
+                     "\n\nEs la resolución a la que se dibuja el juego (más baja = más FPS)."
                      "\nSe aplica en el próximo cuadro.",
                  buttons);
     if (id < 0 || id >= int(std::size(kScales))) return;
@@ -273,8 +319,12 @@ static void ShowVirtualPad(bool on)
 void VideoOptionsInit(SDL_Window* w)
 {
     Load();
-    if (const char* e = getenv("BO3_RENDER_SCALE")) s_cfg.renderScale = std::clamp(float(atof(e)), 0.5f, 3.0f);
+    if (const char* e = getenv("BO3_RENDER_SCALE")) s_cfg.renderScale = std::clamp(float(atof(e)), 0.25f, 1.0f);
     RendererSetScale(s_cfg.renderScale);
+    if (const char* e = getenv("BO3_SHADOWS")) s_cfg.shadows = std::clamp(atoi(e), 0, 1);
+    RendererSetShadowQuality(s_cfg.shadows);
+    ShaderTranslatorSetLite(s_cfg.liteShaders);   // (BO3_SHADER_LITE=1/0 overrides it)
+    Log("options: shadows %s, %s shaders", s_cfg.shadows ? "high" : "low", ShaderTranslatorLite() ? "light" : "normal");
     if (const char* e = getenv("BO3_FPS")) s_cfg.fpsOverlay = std::clamp(atoi(e), 0, 2);
     RendererSetOverlay(s_cfg.fpsOverlay);
     if (const char* e = getenv("BO3_FPS_LIMIT")) s_cfg.fpsLimit = std::clamp(atoi(e), 30, 480);
@@ -374,9 +424,47 @@ void VideoOptionsSetFullscreen(SDL_Window* w, bool on)
     Save();
 }
 
+#ifdef __ANDROID__
+// com.bo3recomp.OptionsPanel.show(scale, overlay, limit, pad, online, shadows, lite) -> { scale, overlay, limit, pad, shadows, lite }, or false
+static bool AndroidOptionsPanel()
+{
+    JNIEnv* env = (JNIEnv*)SDL_GetAndroidJNIEnv();
+    if (!env) return false;
+    jclass cls = env->FindClass("com/bo3recomp/OptionsPanel");
+    if (!cls) { env->ExceptionClear(); return false; }
+    jmethodID mid = env->GetStaticMethodID(cls, "show", "(FIIZIIZ)[F");
+    if (!mid) { env->ExceptionClear(); env->DeleteLocalRef(cls); return false; }
+    auto res = (jfloatArray)env->CallStaticObjectMethod(cls, mid, jfloat(s_cfg.renderScale), jint(s_cfg.fpsOverlay), jint(s_cfg.fpsLimit),
+                                                         jboolean(s_cfg.virtualPad), jint(RendezvousOnlineCount()), jint(s_cfg.shadows),
+                                                         jboolean(s_cfg.liteShaders));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); res = nullptr; }
+    env->DeleteLocalRef(cls);
+    if (!res || env->GetArrayLength(res) < 6) return false;
+    float v[6];
+    env->GetFloatArrayRegion(res, 0, 6, v);
+    if (int(v[4]) != s_cfg.shadows) { s_cfg.shadows = std::clamp(int(v[4]), 0, 1); RendererSetShadowQuality(s_cfg.shadows); Log("options: shadows %s", s_cfg.shadows ? "high" : "low"); }
+    if ((v[5] != 0) != s_cfg.liteShaders) { s_cfg.liteShaders = v[5] != 0; Log("options: %s shaders at the next start", s_cfg.liteShaders ? "light" : "normal"); }
+    env->DeleteLocalRef(res);
+    if (std::fabs(v[0] - s_cfg.renderScale) > 0.01f)
+    {
+        s_cfg.renderScale = std::clamp(v[0], 0.25f, 3.0f);
+        RendererSetScale(s_cfg.renderScale);
+        Log("options: internal resolution %s", ScaleName(s_cfg.renderScale).c_str());
+    }
+    if (int(v[1]) != s_cfg.fpsOverlay) { s_cfg.fpsOverlay = std::clamp(int(v[1]), 0, 2); RendererSetOverlay(s_cfg.fpsOverlay); }
+    if (int(v[2]) != s_cfg.fpsLimit) { s_cfg.fpsLimit = std::clamp(int(v[2]), 30, 480); GpuSetFrameLimit(s_cfg.fpsLimit); }
+    if ((v[3] != 0) != s_cfg.virtualPad) { s_cfg.virtualPad = v[3] != 0; ShowVirtualPad(s_cfg.virtualPad); }
+    Save();
+    return true;
+}
+#endif
+
 void VideoOptionsDialog(SDL_Window* w)
 {
     HostInputReleaseMouse();
+#ifdef __ANDROID__
+    if (AndroidOptionsPanel()) return;   // (the message boxes below only if the panel is missing)
+#endif
     for (;;)
     {
         // online players (refreshed every 10 s by the rendezvous): shown on every page of the menu
@@ -407,7 +495,7 @@ void VideoOptionsDialog(SDL_Window* w)
 #else
         int id = Ask(w, "Opciones - BO3 Recomp", text,
                      { std::string("Pantalla completa: ") + (s_cfg.fullscreen ? "ON" : "OFF"), "Resolución interna...", "Tamaño de ventana...",
-                       std::string("Contador de FPS: ") + kOverlayNames[s_cfg.fpsOverlay], "Límite de FPS...", "Mouse...", "Cerrar" });
+                       std::string("Contador de FPS: ") + kOverlayNames[s_cfg.fpsOverlay], "Límite de FPS...", "Mouse...", "Gráficos...", "Cerrar" });
 #endif
         if (id == 0) VideoOptionsSetFullscreen(w, !s_cfg.fullscreen);
         else if (id == 1) RenderScaleDialog(w);
@@ -415,6 +503,9 @@ void VideoOptionsDialog(SDL_Window* w)
         else if (id == 3) VideoOptionsCycleOverlay();
         else if (id == 4) FpsLimitDialog(w);
         else if (id == 5) MouseDialog(w);
+#ifndef __ANDROID__
+        else if (id == 6) GraphicsDialog(w);
+#endif
         else break;
     }
 }
