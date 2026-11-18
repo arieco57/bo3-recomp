@@ -9,6 +9,7 @@
 #include "guest.h"
 #include "stubs.h"
 #include "thread.h"
+#include "xma.h"
 
 #include <SDL3/SDL.h>
 
@@ -16,6 +17,10 @@
 #include <atomic>
 #include <cmath>
 #include <mutex>
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 namespace
 {
@@ -31,6 +36,19 @@ SDL_AudioStream* s_stream = nullptr;
 float s_volume = 1.0f;
 constexpr int kFrameSamples = 256;
 constexpr int kFrameBytes = kFrameSamples * 2 * sizeof(float);   // stereo float
+// frames kept queued: 3 (16 ms) on desktops; phones' audio services pull bigger bursts and the
+// mixing thread gets preempted more, so more slack there
+// On a phone the game's callback sometimes stalls for 30-45 ms (another game thread holding a
+// lock it needs, the thread preempted) - longer than the queue lasts, so it ran dry (sound cutting
+// out). There the queue starts at 53 ms and grows by 16 ms whenever it runs dry, up to 160 ms.
+#ifdef __ANDROID__
+constexpr int kQueueFramesMin = 10, kQueueFramesMax = 30;
+#else
+constexpr int kQueueFramesMin = 3, kQueueFramesMax = 3;
+#endif
+int s_queueFrames = kQueueFramesMin;
+double s_mixMs = 0, s_mixMaxMs = 0;   // time in the clients' callbacks (since the last log line)
+uint64_t s_starved = 0;               // checks that found the queue empty (audible gaps)
 
 void OpenOutput()
 {
@@ -62,6 +80,13 @@ void AudioThread(GuestThread& t)
     // Give the client time to finish initialising after registration (real hardware also
     // starts calling back asynchronously, after the DMA engine spins up).
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+#ifdef __ANDROID__
+    // the mixing runs here (guest code): on a phone the game's own threads otherwise take its CPU
+    // and it falls behind real time (choppy sound). Android's "urgent audio" priority.
+    if (setpriority(PRIO_PROCESS, 0, -19) != 0 && setpriority(PRIO_PROCESS, 0, -10) != 0)
+        LogWarn("audio: cannot raise the mixing thread's priority");
+    Log("audio: mixing thread priority %d", getpriority(PRIO_PROCESS, 0));
+#endif
     OpenOutput();
     uint64_t ticks = 0;
     auto next = std::chrono::steady_clock::now();
@@ -69,16 +94,32 @@ void AudioThread(GuestThread& t)
     {
         if (s_stream)
         {
-            // keep ~3 frames (16 ms) queued: call the clients whenever the queue drains below it
+            // keep s_queueFrames queued: call the clients whenever the queue drains below it
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             int calls = 0;
-            while (SDL_GetAudioStreamQueued(s_stream) < 3 * kFrameBytes && calls < 4)
+            if (ticks > 200 && SDL_GetAudioStreamQueued(s_stream) == 0)
+            {
+                s_starved++;
+                if (s_queueFrames < kQueueFramesMax)
+                {
+                    s_queueFrames = std::min(kQueueFramesMax, s_queueFrames + 3);
+                    Log("audio: the queue ran dry - keeping %d ms queued now", s_queueFrames * kFrameSamples * 1000 / 48000);
+                }
+            }
+            while (SDL_GetAudioStreamQueued(s_stream) < s_queueFrames * kFrameBytes && calls < 16)
             {
                 uint64_t before = s_framesSubmitted;
+                auto t0 = std::chrono::steady_clock::now();
                 CallClients(t);
+                double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                s_mixMs += ms;
+                s_mixMaxMs = std::max(s_mixMaxMs, ms);
                 calls++;
                 ticks++;
                 if (s_framesSubmitted == before) break;   // nothing mixed: don't spin
+                // frames back to back (refilling the queue): the decoder fills the voices' output
+                // rings between two, as on the console - otherwise streamed voices ran dry
+                XmaWaitIdle(4000);
             }
         }
         else
@@ -88,14 +129,20 @@ void AudioThread(GuestThread& t)
             CallClients(t);
             ticks++;
         }
-        if (ticks && ticks % 940 == 0)
+        // every ~5 s (940 frames); the averages cover the frames since the last line
+        static uint64_t lastLogged = 0;
+        if (ticks >= lastLogged + 940)
         {
-            static uint64_t lastLogged = 0;
-            if (lastLogged != ticks)
             {
+                uint64_t frames = ticks - lastLogged;
                 lastLogged = ticks;
-                Log("audio: %llu callbacks, %llu frames submitted, peak %.3f", (unsigned long long)ticks, (unsigned long long)s_framesSubmitted.load(), s_peak);
+                // (5.33 ms of sound per frame: the mixing must stay well below that on average)
+                Log("audio: %llu callbacks, %llu frames submitted, peak %.3f, mixing %.2f ms/frame (max %.1f), %llu empty-queue checks",
+                    (unsigned long long)ticks, (unsigned long long)s_framesSubmitted.load(), s_peak, s_mixMs / double(frames), s_mixMaxMs,
+                    (unsigned long long)s_starved);
                 s_peak = 0;
+                s_mixMs = s_mixMaxMs = 0;
+                s_starved = 0;
             }
         }
     }
@@ -140,6 +187,8 @@ GUEST_IMPORT(XAudioUnregisterRenderDriverClient)
 GUEST_IMPORT(XAudioSubmitRenderDriverFrame)
 {
     s_framesSubmitted++;
+    if (static FILE* dump6 = [] { const char* p = getenv("BO3_AUDIO_DUMP6"); return p ? fopen(p, "wb") : nullptr; }(); dump6 && ARG(4))
+        fwrite(g_base + ARG(4), 1, kFrameSamples * 6 * 4, dump6);   // diagnostics: the 6 planar big-endian channels as submitted
     if (s_stream && ARG(4))
     {
         const uint8_t* src = g_base + ARG(4);

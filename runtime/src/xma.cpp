@@ -19,6 +19,7 @@
 #include "memory.h"
 #include "stubs.h"
 #include "xma.h"
+#include "write_watch.h"
 #include "arch.h"
 
 extern "C" {
@@ -28,12 +29,14 @@ extern "C" {
 }
 
 #include <semaphore.h>
+#include <sys/resource.h>
 #include <sys/mman.h>
 #include <ucontext.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -67,6 +70,11 @@ struct Context
     AVCodecContext* av = nullptr;
     int avRate = 0, avChannels = 0;
     bool fedSinceDrain = false;
+    float peak = 0;             // loudest decoded sample since the last log line (BO3_XMA_LOG)
+    int frameCh = 0;            // channels of the last decoded frame
+    bool full = false;          // output ring filled (write == read) and not read since
+    uint32_t fullRead = 0;
+    std::chrono::steady_clock::time_point fullTime;   // (a whole ring read between two passes: given up after 100 ms)
     std::vector<uint8_t> pcm;   // decoded, not yet written (s16 BE, interleaved)
 
     void Lock() { while (busy.test_and_set(std::memory_order_acquire)) { } }
@@ -77,6 +85,8 @@ Context s_ctx[kContextCount];
 uint32_t s_arrayPhys = 0;          // physical address of the context array
 uint8_t* s_regsRW = nullptr;       // writable alias of the register page
 sem_t s_work;
+// kicks posted / handled (XmaWaitIdle)
+std::atomic<uint64_t> s_kickSeq{ 0 }, s_doneSeq{ 0 };
 std::mutex s_allocLock;
 bool s_log = false;
 AVPacket* s_packet = nullptr;
@@ -85,7 +95,14 @@ AVFrame* s_frame = nullptr;
 uint8_t* Phys(uint32_t phys) { return g_base + 0xA0000000u + (phys & 0x1FFFFFFF); }
 uint8_t* ContextData(uint32_t i) { return Phys(s_arrayPhys + i * kContextSize); }
 uint32_t ReadDword(uint32_t i, int d) { uint32_t v; memcpy(&v, ContextData(i) + d * 4, 4); return __builtin_bswap32(v); }
-void WriteDword(uint32_t i, int d, uint32_t v) { v = __builtin_bswap32(v); memcpy(ContextData(i) + d * 4, &v, 4); }
+// (also called from the register page's fault handler: the context's granule is unprotected first - a
+// write-protected granule (write tracking / GPU copy mode) would fault again inside the handler)
+void WriteDword(uint32_t i, int d, uint32_t v)
+{
+    v = __builtin_bswap32(v);
+    WatchHostWriteNow((s_arrayPhys + i * kContextSize + d * 4) & 0x1FFFFFFF, 4);
+    memcpy(ContextData(i) + d * 4, &v, 4);
+}
 uint32_t Bits(uint32_t v, int lo, int n) { return (v >> lo) & ((1u << n) - 1); }
 
 void SetReg(uint32_t reg, uint32_t value) { memcpy(s_regsRW + reg * 4 - (kRegPage - kRegBase), &value, 4); }
@@ -120,6 +137,7 @@ void WriteRegister(uint32_t reg, uint32_t value)
     if (reg >= RegKick && reg < RegKick + 10)
     {
         forEach(reg - RegKick, [](Context& c, uint32_t) { c.kicked.store(true, std::memory_order_release); });
+        s_kickSeq.fetch_add(1, std::memory_order_release);
         sem_post(&s_work);
     }
     else if (reg >= RegLock && reg < RegLock + 10)
@@ -139,21 +157,67 @@ void WriteRegister(uint32_t reg, uint32_t value)
 
 // ------------------------------------------------------------------ decoding
 
+// Opening a decoder takes 5-12 ms on a phone: every sound starting on a context without one paid it,
+// and the other voices waited meanwhile (with several sounds at once, short ones - a shot, a jump -
+// were over before they were decoded: silent). Decoders are kept in a pool by format instead, opened
+// ahead of time for the usual ones (BO3: 32 kHz mono / stereo) while the decoder thread is idle; a
+// context hands its decoder back when its format changes. (Decoder thread only: no lock.)
+struct PoolKey { int rate, channels; };
+std::vector<std::pair<PoolKey, std::vector<AVCodecContext*>>> s_pool;
+constexpr size_t kPoolWarm = 6;   // kept ready per usual format
+
+std::vector<AVCodecContext*>& PoolFor(int rate, int channels)
+{
+    for (auto& p : s_pool) if (p.first.rate == rate && p.first.channels == channels) return p.second;
+    s_pool.push_back({ { rate, channels }, {} });
+    return s_pool.back().second;
+}
+
+AVCodecContext* OpenDecoder(int rate, int channels)
+{
+    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_XMA2);
+    if (!codec) return nullptr;
+    AVCodecContext* av = avcodec_alloc_context3(codec);
+    av_channel_layout_default(&av->ch_layout, channels);
+    av->sample_rate = rate;
+    av->block_align = kPacketBytes;
+    // XMA2WAVEFORMATEX-sized extradata: 1 stream, no channel mask
+    av->extradata = static_cast<uint8_t*>(av_mallocz(34 + AV_INPUT_BUFFER_PADDING_SIZE));
+    av->extradata_size = 34;
+    av->extradata[0] = 1;
+    if (avcodec_open2(av, codec, nullptr) < 0) { avcodec_free_context(&av); return nullptr; }
+    return av;
+}
+
+// (decoder thread, nothing kicked) opens one more decoder for a usual format below its target
+bool PoolTopUp()
+{
+    static const PoolKey usual[] = { { 32000, 2 }, { 32000, 1 } };
+    for (const PoolKey& k : usual)
+    {
+        auto& v = PoolFor(k.rate, k.channels);
+        if (v.size() >= kPoolWarm) continue;
+        if (AVCodecContext* av = OpenDecoder(k.rate, k.channels)) v.push_back(av);
+        return true;
+    }
+    return false;
+}
+
 bool EnsureDecoder(Context& c, int rate, int channels)
 {
     if (c.av && c.avRate == rate && c.avChannels == channels) return true;
-    if (c.av) avcodec_free_context(&c.av);
-    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_XMA2);
-    if (!codec) return false;
-    c.av = avcodec_alloc_context3(codec);
-    av_channel_layout_default(&c.av->ch_layout, channels);
-    c.av->sample_rate = rate;
-    c.av->block_align = kPacketBytes;
-    // XMA2WAVEFORMATEX-sized extradata: 1 stream, no channel mask
-    c.av->extradata = static_cast<uint8_t*>(av_mallocz(34 + AV_INPUT_BUFFER_PADDING_SIZE));
-    c.av->extradata_size = 34;
-    c.av->extradata[0] = 1;
-    if (avcodec_open2(c.av, codec, nullptr) < 0) { avcodec_free_context(&c.av); return false; }
+    if (c.av)
+    {
+        avcodec_flush_buffers(c.av);
+        auto& back = PoolFor(c.avRate, c.avChannels);
+        if (back.size() < 4 * kPoolWarm) back.push_back(c.av);
+        else avcodec_free_context(&c.av);
+        c.av = nullptr;
+    }
+    auto& v = PoolFor(rate, channels);
+    if (!v.empty()) { c.av = v.back(); v.pop_back(); }
+    else c.av = OpenDecoder(rate, channels);
+    if (!c.av) return false;
     c.avRate = rate;
     c.avChannels = channels;
     c.fedSinceDrain = false;
@@ -179,6 +243,7 @@ void AppendFrame(Context& c, const AVFrame* f)
     static bool once = false;
     if (!once) { once = true; Log("xma: decoder output format %d, %d samples, %d channels, %d Hz", f->format, f->nb_samples, f->ch_layout.nb_channels, f->sample_rate); }
     int ch = std::min(f->ch_layout.nb_channels, 2);
+    c.frameCh = f->ch_layout.nb_channels;
     size_t start = c.pcm.size();
     c.pcm.resize(start + size_t(f->nb_samples) * c.avChannels * 2);
     uint8_t* out = c.pcm.data() + start;
@@ -186,6 +251,7 @@ void AppendFrame(Context& c, const AVFrame* f)
         for (int k = 0; k < c.avChannels; k++)
         {
             float v = reinterpret_cast<const float*>(f->extended_data[std::min(k, ch - 1)])[s];
+            c.peak = std::max(c.peak, std::fabs(v));
             int16_t x = int16_t(std::lrint(std::clamp(v, -1.0f, 1.0f) * 32767.0f));
             *out++ = uint8_t(uint16_t(x) >> 8);
             *out++ = uint8_t(x);
@@ -208,7 +274,14 @@ void FeedPacket(Context& c, const uint8_t* packet)
     memset(buf + kPacketBytes, 0, AV_INPUT_BUFFER_PADDING_SIZE);
     s_packet->data = buf;
     s_packet->size = kPacketBytes;
-    if (avcodec_send_packet(c.av, s_packet) == 0) c.fedSinceDrain = true;
+    int r = avcodec_send_packet(c.av, s_packet);
+    if (r == 0) c.fedSinceDrain = true;
+    else
+    {
+        static std::atomic<int> errors{ 0 };
+        if (errors++ < 20)
+            Log("xma: ctx %u: the decoder refused a packet (%d) | %02X %02X %02X %02X", uint32_t(&c - s_ctx), r, packet[0], packet[1], packet[2], packet[3]);
+    }
     Receive(c);
 }
 
@@ -220,6 +293,7 @@ void Drain(Context& c)
     c.fedSinceDrain = false;
 }
 
+extern std::atomic<uint64_t> s_statStarved;
 void Work(uint32_t id)
 {
     Context& c = s_ctx[id];
@@ -229,9 +303,18 @@ void Work(uint32_t id)
         c.Unlock();
         return;
     }
+    if (c.needsReset && s_log)
+    {
+        uint32_t r[10];
+        for (int k = 0; k < 10; k++) r[k] = ReadDword(id, k);
+        Log("xma: ctx %u start: d0 %08X d1 %08X d2 %08X d3 %08X d4 %08X (loop count %u, start %u, end %u, subframes %u/%u, ib0 %u ib1 %u packets)", id,
+            r[0], r[1], r[2], r[3], r[4], Bits(r[0], 12, 8), Bits(r[3], 0, 26), Bits(r[4], 0, 26), Bits(r[3], 26, 3), Bits(r[4], 26, 3),
+            Bits(r[0], 0, 12), Bits(r[1], 0, 12));
+    }
     if (c.needsReset)
     {
         c.needsReset = false;
+        c.full = false;
         if (c.av) avcodec_flush_buffers(c.av);
         c.fedSinceDrain = false;
         c.pcm.clear();
@@ -256,7 +339,22 @@ void Work(uint32_t id)
     const uint32_t loopStart = Bits(d3, 0, 26), loopEnd = Bits(d4, 0, 26);
     bool invalidated[2] = { false, false }, curChanged = false, loopChanged = false;
 
-    uint32_t freeBlocks = readBlock > writeBlock ? readBlock - writeBlock : capacity - writeBlock + readBlock;
+    // write == read is ambiguous (empty or full). Like the hardware, remember that the ring was
+    // filled: until the game reads (its read offset moves) nothing is written, even if it marks the
+    // output valid and kicks again right away - otherwise the blocks it has not read yet were
+    // overwritten (the first 24 ms of every short sound lost: gunshots barely audible).
+    // Read position back where it was can also mean the game read the whole ring (a burst of mixing
+    // frames on a phone): once the ring's length of time has passed, it counts as read. (A fixed
+    // 100 ms here played streamed voices as 24 ms pieces every 100 ms - choppy announcer.)
+    if (c.full)
+    {
+        const double ringSec = double(capacity) * kBlockBytes / (double(std::max(c.avRate, 8000)) * std::max(c.avChannels, 1) * 2);
+        if (readBlock != c.fullRead || writeBlock != readBlock ||
+            std::chrono::steady_clock::now() - c.fullTime > std::chrono::duration<double>(ringSec * 0.9))
+            c.full = false;
+    }
+    uint32_t freeBlocks = c.full ? 0 : readBlock > writeBlock ? readBlock - writeBlock : capacity - writeBlock + readBlock;
+    if (freeBlocks == capacity && (valid[0] || valid[1]) && c.fedSinceDrain) s_statStarved++;   // the game read everything: late
     uint32_t written = 0;
     int packetsFed = 0;
     while (freeBlocks > 0)
@@ -328,7 +426,14 @@ void Work(uint32_t id)
     if (invalidated[1]) d0 &= ~(1u << 21);
     d0 = (d0 & ~(31u << 27)) | (writeBlock << 27);
     if (loopChanged) d0 = (d0 & ~(0xFFu << 12)) | (loopCount << 12);
-    if (written && freeBlocks == 0) d1 &= ~(1u << 31);   // output ring full
+    if (written && freeBlocks == 0)   // output ring full
+    {
+        d1 &= ~(1u << 31);
+        static const bool oldRing = getenv("BO3_XMA_OLD_RING") != nullptr;   // diagnostics: the previous (overwriting) behaviour
+        c.full = !oldRing;
+        c.fullRead = readBlock;
+        c.fullTime = std::chrono::steady_clock::now();
+    }
     d2 = (d2 & ~0x3FFFFFFu) | (readOffset & 0x3FFFFFF);
     if (curChanged) d4 = (d4 & ~(1u << 31)) | (cur << 31);
     WriteDword(id, 0, d0);
@@ -337,18 +442,55 @@ void Work(uint32_t id)
     WriteDword(id, 4, d4);
     c.Unlock();
     if (s_log && (written || packetsFed))
-        Log("xma: ctx %u: %d packets -> %u blocks (ring %u/%u, buffers %u%u, %d Hz %dch)", id, packetsFed, written, writeBlock,
-            capacity, valid[0], valid[1], c.avRate, channels);
+    {
+        Log("xma: ctx %u: %d packets -> %u blocks (ring %u/%u, buffers %u%u, %d Hz %dch, peak %.3f, frame ch %d)", id, packetsFed, written, writeBlock,
+            capacity, valid[0], valid[1], c.avRate, channels, c.peak, c.frameCh);
+        c.peak = 0;
+    }
+}
+
+// BO3_XMA_STATS=1: decoder load every 2 s (busy time, rings found empty = voices that ran dry)
+std::atomic<uint64_t> s_statStarved{ 0 };
+void Stats(double workMs)
+{
+    static const bool on = getenv("BO3_XMA_STATS") != nullptr;
+    if (!on) return;
+    static auto last = std::chrono::steady_clock::now();
+    static double busy = 0, worst = 0;
+    static uint64_t works = 0;
+    busy += workMs; worst = std::max(worst, workMs); works++;
+    if (workMs > 8) Log("xma: slow pass %.1f ms", workMs);
+    auto now = std::chrono::steady_clock::now();
+    double el = std::chrono::duration<double>(now - last).count();
+    if (el < 2.0) return;
+    Log("xma stats: %llu passes, busy %.0f%%, worst %.1f ms, %llu rings found empty", (unsigned long long)works, busy / (el * 10.0), worst,
+        (unsigned long long)s_statStarved.exchange(0));
+    last = now; busy = worst = 0; works = 0;
 }
 
 void Worker()
 {
     pthread_setname_np(pthread_self(), "xma-decoder");
+#ifdef __ANDROID__
+    // like the mixing thread (audio.cpp): late decoding leaves the game's voices without samples
+    // (sounds cut short) - on a phone the game's threads would otherwise keep this one waiting
+    if (setpriority(PRIO_PROCESS, 0, -16) != 0) LogWarn("xma: cannot raise the decoder thread's priority");
+#endif
     for (;;)
     {
-        sem_wait(&s_work);
+        // idle: get decoders ready (one at a time, then look for work again)
+        while (sem_trywait(&s_work) != 0)
+            if (!PoolTopUp()) { sem_wait(&s_work); break; }
+        uint64_t seq = s_kickSeq.load(std::memory_order_acquire);
         for (uint32_t i = 0; i < kContextCount; i++)
-            if (s_ctx[i].kicked.exchange(false, std::memory_order_acq_rel)) Work(i);
+            if (s_ctx[i].kicked.exchange(false, std::memory_order_acq_rel))
+            {
+                auto t0 = std::chrono::steady_clock::now();
+                Work(i);
+                Stats(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            }
+        uint64_t done = s_doneSeq.load(std::memory_order_relaxed);
+        while (done < seq && !s_doneSeq.compare_exchange_weak(done, seq, std::memory_order_release)) { }
     }
 }
 
@@ -429,7 +571,9 @@ void XmaInit()
     s_packet = av_packet_alloc();
     s_frame = av_frame_alloc();
     sem_init(&s_work, 0, 0);
-    s_arrayPhys = g_physicalHeap.Alloc(kContextCount * kContextSize, 256) & 0x1FFFFFFF;
+    // a 64 KiB write-tracking granule of its own: the GPU never reads it, so it is never write
+    // protected and the decoder's writes need no lock (write_watch.cpp)
+    s_arrayPhys = g_physicalHeap.Alloc((kContextCount * kContextSize + 0xFFFF) & ~0xFFFFu, 0x10000) & 0x1FFFFFFF;
 
     // register page: guest view read-only, host alias writable
     int fd = HostMemfd("bo3-xma-regs");
@@ -502,4 +646,15 @@ GUEST_IMPORT(XMAReleaseContext)
         c.Unlock();
     }
     RETURN(0);
+}
+
+// Waits (up to maxUs) until the decoder has handled every kick so far: the audio driver calls this
+// between mixing frames it runs back to back, as the console's decoder would have kept up.
+void XmaWaitIdle(int maxUs)
+{
+    uint64_t target = s_kickSeq.load(std::memory_order_acquire);
+    if (s_doneSeq.load(std::memory_order_acquire) >= target) return;
+    auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(maxUs);
+    while (s_doneSeq.load(std::memory_order_acquire) < target && std::chrono::steady_clock::now() < end)
+        std::this_thread::yield();
 }
