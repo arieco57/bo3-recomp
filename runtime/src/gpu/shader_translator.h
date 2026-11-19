@@ -58,4 +58,6 @@ void ShaderTranslatorSetPrimEmu(bool on);
 bool ShaderTranslatorPrimEmu();
 // the device's Vulkan minor version (SPIR-V target) and inf/nan preservation support: part of the cache identity
 void ShaderTranslatorSetDevice(int vulkanMinor, bool floatControls);
+void ShaderTranslatorSetTexSlots(uint32_t n);
+void ShaderTranslatorSetStores(bool vertex, bool fragment);   // storage writes allowed per stage (device features)   // texture slots per kind (g_vk.texSlots)
 void ShaderCompilerSetVulkanVersion(int minor);

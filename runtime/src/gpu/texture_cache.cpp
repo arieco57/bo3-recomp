@@ -1082,7 +1082,7 @@ bool ResolveFetch(VkCommandBuffer cmd, uint32_t t, TexKind kind, VkDescriptorIma
     static const bool depthFilter = [] {
         if (!getenv("BO3_DEPTH_FILTER")) return false;
         VkFormatProperties fp;
-        vkGetPhysicalDeviceFormatProperties(g_vk.phys, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
+        vkGetPhysicalDeviceFormatProperties(g_vk.phys, g_vk.depthFormat, &fp);
         bool ok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) || getenv("BO3_DEPTH_FILTER_FORCE");
         Log("texture: depth fetches filtered %s", ok ? "linearly" : "- not supported by the depth format, point");
         return ok;
@@ -1607,7 +1607,7 @@ VkDescriptorSet TextureCacheBuildSet(VkCommandBuffer cmd, VkDescriptorPool pool,
         }
         if (!m.ok) continue;   // dummy
         Cache::SetEntry& e = entries[n++];
-        e.slot = t | (uint32_t(kind) << 5);
+        e.slot = (t % g_vk.texSlots) | (uint32_t(kind) << 5);
         e.view = m.info.imageView;
         e.sampler = m.info.sampler;
         key = (key ^ e.slot) * 1099511628211ull;
@@ -1687,7 +1687,7 @@ VkDescriptorSet TextureCacheBuildSet(VkCommandBuffer cmd, VkDescriptorPool pool,
     VkDescriptorImageInfo infos[3][32];
     VkImageView dv[3] = { c.dummy2D.view, c.dummy3D.view, c.dummyCube.view };
     for (uint32_t b = 0; b < 3; b++)
-        for (uint32_t i = 0; i < 32; i++) infos[b][i] = { dummySampler, dv[b], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        for (uint32_t i = 0; i < g_vk.texSlots; i++) infos[b][i] = { dummySampler, dv[b], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     for (uint32_t i = 0; i < n; i++)
         infos[entries[i].slot >> 5][entries[i].slot & 31] = { entries[i].sampler, entries[i].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkWriteDescriptorSet w[3] = {};
@@ -1696,7 +1696,7 @@ VkDescriptorSet TextureCacheBuildSet(VkCommandBuffer cmd, VkDescriptorPool pool,
         w[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[b].dstSet = set;
         w[b].dstBinding = b;
-        w[b].descriptorCount = 32;
+        w[b].descriptorCount = g_vk.texSlots;
         w[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[b].pImageInfo = infos[b];
     }

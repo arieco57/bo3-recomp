@@ -1019,6 +1019,12 @@ void VkInit()
         g_vk.hasBC = f2.features.textureCompressionBC;
         if (!g_vk.hasBC) LogWarn("vk: no BC (DXT) textures on this GPU: decoded on the CPU (slower loading)");
         if (!g_vk.hasAnisotropy) g_vk.maxAnisotropy = 1.0f;   // samplers then never request it
+        if (getenv("BO3_NO_VS_STORES")) f2.features.vertexPipelineStoresAndAtomics = VK_FALSE;   // (tests)
+        g_vk.storeFlags = (f2.features.vertexPipelineStoresAndAtomics ? 0u : 1u) | (f2.features.fragmentStoresAndAtomics ? 0u : 2u);
+        ShaderTranslatorSetStores(f2.features.vertexPipelineStoresAndAtomics, f2.features.fragmentStoresAndAtomics);
+        if (!f2.features.vertexPipelineStoresAndAtomics || !f2.features.fragmentStoresAndAtomics)
+            LogWarn("vk: no storage writes from %s shaders: their memory exports are dropped",
+                    !f2.features.vertexPipelineStoresAndAtomics && !f2.features.fragmentStoresAndAtomics ? "vertex or fragment" : !f2.features.vertexPipelineStoresAndAtomics ? "vertex" : "fragment");
     }
     int spvMinor = v13 ? 3 : v12 ? 2 : 1;
     if (const char* e = getenv("BO3_SPIRV_VK")) spvMinor = std::clamp(atoi(e), 1, spvMinor);   // (tests the SPIR-V of older drivers)
@@ -1074,6 +1080,43 @@ void VkInit()
         }
         Log("vk: formats without linear filtering:%s; not sampleable:%s", noFilter.empty() ? " none" : noFilter.c_str(),
             noSample.empty() ? " none" : noSample.c_str());
+    }
+    // Limits that differ between phone GPUs (Mali / PowerVR / Xclipse / older Adreno drivers): texture
+    // slots per shader and the depth format adapt to them; the rest is reported for error reports.
+    {
+        const VkPhysicalDeviceLimits& L = g_vk.props.limits;
+        Log("vk: limits: storage buffer range %u MiB, per stage %u samplers / %u sampled images / %u resources, per set %u samplers / %u sampled images, "
+            "push constants %u, bound sets %u", L.maxStorageBufferRange >> 20, L.maxPerStageDescriptorSamplers, L.maxPerStageDescriptorSampledImages,
+            L.maxPerStageResources, L.maxDescriptorSetSamplers, L.maxDescriptorSetSampledImages, L.maxPushConstantsSize, L.maxBoundDescriptorSets);
+        // set 1: 3 arrays (2D / 3D / cube) of combined image samplers, every graphics stage; set 0: the guest
+        // memory buffer and two uniform blocks; up to 4 colour attachments
+        uint32_t lim = std::min({ L.maxPerStageDescriptorSamplers, L.maxPerStageDescriptorSampledImages, L.maxDescriptorSetSamplers,
+                                  L.maxDescriptorSetSampledImages, L.maxPerStageResources > 7 ? L.maxPerStageResources - 7 : 3u });
+        uint32_t slots = std::clamp<uint32_t>(lim / 3, 1, 32);
+        if (const char* e = getenv("BO3_TEX_SLOTS")) slots = std::clamp<uint32_t>(uint32_t(atoi(e)), 1, slots);   // (tests)
+        g_vk.texSlots = slots;
+        if (slots < 32) LogWarn("vk: descriptor limits allow %u textures per kind and shader (of 32): fetch constant t uses slot t %% %u", slots, slots);
+        ShaderTranslatorSetTexSlots(slots);
+        if (L.maxStorageBufferRange < (512u << 20))
+            LogWarn("vk: storage buffers reach %u MiB of the 512 MiB guest memory (vertex data / exports beyond may read 0)", L.maxStorageBufferRange >> 20);
+        // depth: rendered to, sampled (24_8 fetches of resolved depth) and copied / blitted (resolves)
+        auto depthOk = [](VkFormat f) {
+            VkFormatProperties fp;
+            vkGetPhysicalDeviceFormatProperties(g_vk.phys, f, &fp);
+            const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+            return (fp.optimalTilingFeatures & need) == need;
+        };
+        const bool forceD32 = getenv("BO3_DEPTH_D32") != nullptr;   // (tests)
+        if ((!depthOk(VK_FORMAT_D24_UNORM_S8_UINT) || forceD32) && depthOk(VK_FORMAT_D32_SFLOAT_S8_UINT))
+        {
+            g_vk.depthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
+            LogWarn("vk: depth surfaces as D32S8 (%s)", forceD32 ? "BO3_DEPTH_D32" : "no D24S8 depth attachments here");
+        }
+        else if (!depthOk(VK_FORMAT_D24_UNORM_S8_UINT)) LogWarn("vk: neither D24S8 nor D32S8 can be rendered to and sampled here - depth may fail");
+        VkFormatProperties dp;
+        vkGetPhysicalDeviceFormatProperties(g_vk.phys, g_vk.depthFormat, &dp);
+        if (!(dp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(dp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT))
+            LogWarn("vk: the depth format cannot be blitted here (scaled depth resolves may be wrong)");
     }
     // Pipeline cache on disk: drivers without their own disk cache (Turnip on Android: Mesa's is
     // off there) otherwise recompile every pipeline each run (~250 ms each on an Adreno 618).

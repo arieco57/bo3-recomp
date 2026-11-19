@@ -165,6 +165,11 @@ struct R
     std::string shotPath;
 
     bool inPass = false;
+    // Dynamic rendering: a pass begins at its first draw (PassBegin), so clears before it become clear
+    // load ops (tilers: no load of the targets) and a pass without draws is not begun at all
+    bool passPending = false, pendClear = false;
+    VkRenderingInfo pendRi{};
+    VkRenderingAttachmentInfo pendCa[4] = {}, pendDa{}, pendSa{};
     VkImage passColor[4] = {};
     VkImage passDepth = VK_NULL_HANDLE;
     uint32_t passWidth = 0, passHeight = 0, passMsaa = 0;
@@ -318,7 +323,7 @@ void BeginFrame()
                 for (auto& [k, e] : acc) v.push_back({ e.first, k });
                 std::sort(v.rbegin(), v.rend());
                 Log("gpu timing: %.2f ms/frame over 60 frames", accTotal / 60);
-                for (size_t k = 0; k < v.size() && k < (TimingMode() == 3 ? 25u : 8u); k++)
+                for (size_t k = 0; k < v.size() && k < (TimingMode() == 3 ? 25u : 16u); k++)
                     Log("  %7.2f ms/frame  %5.1f/frame  %s", v[k].first / 60, double(acc[v[k].second].second) / 60, v[k].second.c_str());
                 acc.clear();
                 accTotal = 0;
@@ -358,9 +363,29 @@ void BeginFrame()
     TimingMark("frame start");
 }
 
-void EndPass()
+// why passes end (BO3_PASS_STATS; tilers load and store the targets of every pass)
+static uint32_t s_passEnd[10];
+static double s_passEndMpx[10];   // (megasamples of the ended passes' area x attachments)
+static const char* const kPassEndWhy[10] = { "other", "new RT image", "resolve", "textures", "targets", "taller", "memexport", "guest flush", "mid-frame submit", "swap" };
+void PassBegin(VkCommandBuffer cmd)
+{
+    if (!r.passPending) return;
+    r.passPending = false;
+    r.pendRi.pColorAttachments = r.pendCa;
+    if (r.pendRi.pDepthAttachment) { r.pendRi.pDepthAttachment = &r.pendDa; r.pendRi.pStencilAttachment = &r.pendSa; }
+    vkCmdBeginRendering(cmd, &r.pendRi);
+}
+
+void EndPass(int why = 0)
 {
     if (!r.inPass) return;
+    if (r.passPending)
+    {
+        if (!r.pendClear) { r.passPending = false; r.inPass = false; r.passCount--; return; }   // (nothing drawn)
+        PassBegin(Cur().cmd);
+    }
+    s_passEnd[why]++;
+    s_passEndMpx[why] += double(r.passWidth) * r.passHeight * ((r.passColor[0] ? 1 : 0) + (r.passDepth ? 1 : 0)) / 1e6;
     if (g_vk.hasDynRendering) vkCmdEndRendering(Cur().cmd);
     else vkCmdEndRenderPass(Cur().cmd);
     r.inPass = false;
@@ -443,7 +468,7 @@ void CreateLayouts()
     VK_CHECK(vkCreateDescriptorSetLayout(g_vk.device, &l0, nullptr, &r.setLayout0));
 
     VkDescriptorSetLayoutBinding b1[3] = {};
-    for (uint32_t i = 0; i < 3; i++) b1[i] = { i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32, VK_SHADER_STAGE_ALL_GRAPHICS, nullptr };
+    for (uint32_t i = 0; i < 3; i++) b1[i] = { i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, g_vk.texSlots, VK_SHADER_STAGE_ALL_GRAPHICS, nullptr };
     VkDescriptorSetLayoutCreateInfo l1{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     l1.bindingCount = 3;
     l1.pBindings = b1;
@@ -520,12 +545,12 @@ void EnsureRTHeight(HostRT& rt, uint32_t rows)
     rows = std::min<uint32_t>(rows, MaxRtRows());
     if (rt.img.image && rt.img.height >= rows) return;
     uint32_t h = std::min<uint32_t>(std::max<uint32_t>((rows + 63) & ~63u, rt.img.image ? rt.img.height + rt.img.height / 4 : 0), MaxRtRows());
-    VkFormat vf = rt.depth ? VK_FORMAT_D24_UNORM_S8_UINT : ColorFormat(rt.format);
+    VkFormat vf = rt.depth ? g_vk.depthFormat : ColorFormat(rt.format);
     uint32_t w = std::clamp<uint32_t>(rt.pitch, 1, 16384);
     VkImageUsageFlags common = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     VkImageObj img = rt.depth ? VkCreateImage(w, h, vf, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | common)
                               : VkCreateImage(w, h, vf, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | common);
-    EndPass();
+    EndPass(1);
     VkCommandBuffer cmd = Cur().cmd;
     VkTransition(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkImageSubresourceRange range{ img.aspect, 0, 1, 0, 1 };
@@ -1020,12 +1045,39 @@ void ClearRect(HostRT& rt, const VkClearRect& rect, const VkClearValue& v)
     if (rt.depth) { ri.pDepthAttachment = &a; ri.pStencilAttachment = &a; }
     else { ri.colorAttachmentCount = 1; ri.pColorAttachments = &a; }
     HostRT* one[1] = { &rt };
+    // Dynamic rendering: a pass over just the rectangle with a clear load op - the same result (the
+    // load op clears the render area, the rest of the image is kept) without loading the whole
+    // image and storing it back (tilers: up to 2048 rows each, ~20 times a frame).
+    // Android: on (BO3_OLD_CLEAR=1 turns it off); desktops: BO3_RECT_CLEAR=1
+#ifdef __ANDROID__
+    static const bool oldClear = getenv("BO3_OLD_CLEAR") != nullptr;
+#else
+    static const bool oldClear = getenv("BO3_RECT_CLEAR") == nullptr;
+#endif
+    if (g_vk.hasDynRendering && !oldClear)
+    {
+        VkRect2D area = rect.rect;
+        area.offset.x = std::max(area.offset.x, 0);
+        area.offset.y = std::max(area.offset.y, 0);
+        if (area.offset.x >= int(rt.img.width) || area.offset.y >= int(rt.img.height)) return;
+        area.extent.width = std::min(area.extent.width, rt.img.width - uint32_t(area.offset.x));
+        area.extent.height = std::min(area.extent.height, rt.img.height - uint32_t(area.offset.y));
+        if (!area.extent.width || !area.extent.height) return;
+        ri.renderArea = area;
+        a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        a.clearValue = v;
+        vkCmdBeginRendering(cmd, &ri);
+        vkCmdEndRendering(cmd);
+        if (TimingMode() >= 2) TimingMarkRaw(rt.depth ? "clear depth (rect)" : "clear color (rect)");
+        return;
+    }
     if (g_vk.hasDynRendering) vkCmdBeginRendering(cmd, &ri);
     else BeginRenderPassFallback(cmd, rt.depth ? nullptr : one, rt.depth ? 0 : 1, rt.depth ? &rt : nullptr, rt.img.width, rt.img.height);
     VkClearAttachment ca{ rt.depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT), 0, v };
     vkCmdClearAttachments(cmd, 1, &ca, 1, &rect);
     if (g_vk.hasDynRendering) vkCmdEndRendering(cmd);
     else vkCmdEndRenderPass(cmd);
+    if (TimingMode() >= 2) TimingMarkRaw(rt.depth ? "clear depth (full)" : "clear color (full)");
 }
 
 // ---------------------------------------------------------------- resolve
@@ -1377,7 +1429,7 @@ void Resolve()
         src = &GetRT(ci.color_base, samplePitch, uint32_t(ci.color_format), false, uint32_t(R(y1 * ssy)));
     }
 
-    EndPass();
+    EndPass(2);
     VkCommandBuffer cmd = Cur().cmd;
     if (copy.copy_command != xenos::CopyCommand::kNull && destBase && depthSrc)
     {
@@ -1461,6 +1513,7 @@ void Resolve()
         if (!noResolveMem && (allMem || TextureCacheResolveNeedsMemory(destBase)))
             ResolveToMemory(cmd, *src, x0, y0, x1, y1, destBase, destPitch.copy_dest_pitch, Reg<reg::RB_COPY_DEST_INFO>(), ssx, ssy);
         TimingMark("resolve to memory");
+        if (TimingMode() >= 2) TimingMarkRaw("resolve to memory");
         uint32_t dw = uint32_t(std::ceil(std::max<uint32_t>(destPitch.copy_dest_pitch, uint32_t(x1)) * S)), dh = uint32_t(std::ceil(std::max<uint32_t>(destPitch.copy_dest_height, uint32_t(y1)) * S));
         auto& res = r.resolved[destBase];
         if (!res.img.image || res.img.width < dw || res.img.height < dh || res.img.format != src->img.format)
@@ -1603,7 +1656,9 @@ std::string ShaderCachePath(uint64_t h)
 
 void ShaderCacheInit()
 {
-    std::string id = std::string(ShaderTranslatorBuildId()) + " / " + std::to_string(sizeof(ShaderCacheHeader));
+    std::string id = std::string(ShaderTranslatorBuildId()) + " / " + std::to_string(sizeof(ShaderCacheHeader)) +
+                     (g_vk.texSlots < 32 ? " / slots " + std::to_string(g_vk.texSlots) : std::string()) +
+                     (g_vk.storeFlags ? " / stores " + std::to_string(g_vk.storeFlags) : std::string());
     std::string versionPath = std::string(kShaderCacheDir) + "/version";
     char buf[128] = {};
     if (FILE* f = fopen(versionPath.c_str(), "r")) { size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0; fclose(f); }
@@ -1791,6 +1846,7 @@ void RendererShaderSet(uint32_t type, uint64_t h, std::vector<uint32_t> code)
 }
 
 // A clear quad as vkCmdClearAttachments (see RendererDraw); false = draw it normally.
+static uint32_t s_clearFolded, s_clearFast, s_clearPending, s_clearCand;   // (fast clears that became load ops; stats)
 static bool FastClear(VkCommandBuffer cmd, HostRT* const colors[4], HostRT* depth, const PipelineDesc& pd, reg::RB_DEPTHCONTROL dc,
                       float wx, float wy, float ssx, float ssy, const VkRect2D& sc)
 {
@@ -1826,7 +1882,11 @@ static bool FastClear(VkCommandBuffer cmd, HostRT* const colors[4], HostRT* dept
         for (int k = 0; k < 4; k++) a.clearValue.color.float32[k] = v[0][3 + k];
     }
     static const int depthMode = getenv("BO3_FAST_CLEAR_DEPTH") ? atoi(getenv("BO3_FAST_CLEAR_DEPTH")) : 0;   // (tests)
-    if (depth && depthMode == 0 && (dc.z_enable || dc.stencil_enable)) return false;   // depth: drawn (partial depth clears left lost tiles on RADV)
+    // depth: drawn (partial depth clears left lost tiles on RADV) - unless the clear becomes the load op of
+    // a pass that has not begun (a whole-area clear, checked below)
+    static const bool foldDepth = !getenv("BO3_NO_DEPTH_FOLD");
+    const bool depthOnlyIfFolded = depth && depthMode == 0 && (dc.z_enable || dc.stencil_enable);
+    if (depthOnlyIfFolded && !(foldDepth && r.passPending)) return false;
     if (depth)
     {
         VkImageAspectFlags aspect = 0;
@@ -1852,8 +1912,32 @@ static bool FastClear(VkCommandBuffer cmd, HostRT* const colors[4], HostRT* dept
     if (!n) return false;
     int hx0 = std::max(R((x0 + wx) * ssx), sc.offset.x), hy0 = std::max(R((y0 + wy) * ssy), sc.offset.y);
     int hx1 = std::min(R((x1 + wx) * ssx), sc.offset.x + int(sc.extent.width)), hy1 = std::min(R((y1 + wy) * ssy), sc.offset.y + int(sc.extent.height));
-    if (hx1 <= hx0 || hy1 <= hy0) return true;   // nothing visible
+    if (hx1 <= hx0 || hy1 <= hy0) return !depthOnlyIfFolded;   // nothing visible
     VkClearRect rect{ { { hx0, hy0 }, { uint32_t(hx1 - hx0), uint32_t(hy1 - hy0) } }, 0, 1 };
+    s_clearFast++;
+    if (r.passPending) s_clearPending++;
+    if (r.passPending && hx0 <= 0 && hy0 <= 0 && uint32_t(hx1) >= r.passWidth)
+    {
+        // the pass has not begun: a clear of its whole area is its load op. (The area may shrink to the
+        // cleared rows while nothing else was cleared yet - a draw below them starts a taller pass.)
+        uint32_t bottom = uint32_t(hy1);
+        if (!r.pendClear && bottom < r.passHeight) { r.passHeight = bottom; r.pendRi.renderArea.extent.height = bottom; }
+        if (bottom >= r.passHeight)
+        {
+            for (uint32_t k = 0; k < n; k++)
+            {
+                const VkClearAttachment& a = att[k];
+                if (a.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) { r.pendCa[a.colorAttachment].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; r.pendCa[a.colorAttachment].clearValue = a.clearValue; }
+                if (a.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) { r.pendDa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; r.pendDa.clearValue = a.clearValue; }
+                if (a.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) { r.pendSa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; r.pendSa.clearValue = a.clearValue; }
+            }
+            r.pendClear = true;
+            s_clearFolded++;
+            return true;
+        }
+    }
+    if (depthOnlyIfFolded) return false;
+    PassBegin(cmd);
     vkCmdClearAttachments(cmd, n, att, 1, &rect);
     return true;
 }
@@ -2000,7 +2084,9 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
 
     // Textures first: binding them may need layout transitions, which cannot happen inside
     // a rendering pass.
-    VkDescriptorSet set1 = TextureCacheBuildSet(cmd, f.descPool, vs->t, ps->t, [] { EndPass(); });
+    if (TimingMode() >= 2 && !r.inPass) TimingMarkRaw("between passes: before texture setup");
+    VkDescriptorSet set1 = TextureCacheBuildSet(cmd, f.descPool, vs->t, ps->t, [] { EndPass(3); });
+    if (TimingMode() >= 2 && !r.inPass) TimingMarkRaw("texture setup (uploads, untiling, transitions)");
     if (!set1) { r.skip[7]++; return; }
 
     VkImage wantColor[4] = {};
@@ -2013,7 +2099,7 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
     if (!r.inPass || !FastEq(wantColor, r.passColor, sizeof(wantColor)) || wantDepth != r.passDepth ||
         (hasTargets && !fullArea && needRows > r.passHeight))
     {
-        EndPass();
+        EndPass(r.inPass && FastEq(wantColor, r.passColor, sizeof(wantColor)) && wantDepth == r.passDepth ? 5 : 4);
         VkRenderingAttachmentInfo ca[4] = {};
         uint32_t w = UINT32_MAX, h = kRtHeight * 16;
         for (uint32_t i = 0; i < pd.colorCount; i++)
@@ -2049,7 +2135,21 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
         ri.pDepthAttachment = depth ? &da : nullptr;
         ri.pStencilAttachment = depth ? &da : nullptr;
         if (TimingMode() >= 2) TimingMarkRaw("between passes (copies, waits for the CPU)");
-        if (g_vk.hasDynRendering) vkCmdBeginRendering(cmd, &ri);
+        // Android: on (BO3_EAGER_PASS=1 turns it off); desktops: BO3_LAZY_PASS=1
+#ifdef __ANDROID__
+        static const bool eagerBegin = getenv("BO3_EAGER_PASS") != nullptr;
+#else
+        static const bool eagerBegin = getenv("BO3_LAZY_PASS") == nullptr;
+#endif
+        if (g_vk.hasDynRendering && !eagerBegin)
+        {
+            r.pendRi = ri;
+            memcpy(r.pendCa, ca, sizeof(ca));
+            r.pendDa = r.pendSa = da;
+            r.passPending = true;
+            r.pendClear = false;
+        }
+        else if (g_vk.hasDynRendering) vkCmdBeginRendering(cmd, &ri);
         else BeginRenderPassFallback(cmd, colors, pd.colorCount, depth, w, h);
         r.passCount++;
         r.inPass = true;
@@ -2399,10 +2499,20 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
     // shading every pixel: 9 per frame, ~0.75 ms on the 680M (the 1040x2048 shadow atlas, the scene).
     bool fastCleared = false;
     static const bool noFastClear = getenv("BO3_NO_FAST_CLEAR") != nullptr;
+    if (!indexed && count == 3 && di.prim_type == xenos::PrimitiveType::kRectangleList)
+    {
+        s_clearCand++;
+        static uint32_t logged = 0;
+        if (getenv("BO3_PASS_STATS") && r.swapCount > 30000 && r.swapCount % 600 == 0 && logged++ < 40)
+            Log("rect draw: vs %016llx ps %016llx vte 0x%X alphatest %d bias %g %g depthctl 0x%08X colors %u depth %d",
+                (unsigned long long)r.curVS, (unsigned long long)r.curPS, vte.value, int(Reg<reg::RB_COLORCONTROL>().alpha_test_enable),
+                cur.bias[0], cur.bias[1], depthCtl.value, pd.colorCount, depth ? 1 : 0);
+    }
     if (!noFastClear && r.curVS == 0x3ab766e338a19a76ull && r.curPS == 0x50c7e9595fc160b9ull && !indexed && count == 3 &&
         di.prim_type == xenos::PrimitiveType::kRectangleList && vte.value == 0x300 && !Reg<reg::RB_COLORCONTROL>().alpha_test_enable &&
         cur.bias[0] == 0 && cur.bias[1] == 0)
         fastCleared = FastClear(cmd, colors, depth, pd, depthCtl, wx, wy, ssx, ssy, cur.sc);
+    if (!fastCleared) PassBegin(cmd);
     if (fastCleared) {}
     else if (hostFirstIndex >= 0)
     {
@@ -2412,13 +2522,15 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
             vkCmdBindIndexBuffer(cmd, Cur().indexRing.buffer, 0, it);
             g_idxBound = int(it);
         }
-        vkCmdDrawIndexed(cmd, count, 1, uint32_t(hostFirstIndex), int32_t(GpuReg(XE_GPU_REG_VGT_INDX_OFFSET)), 0);
+        static const bool zeroDraws = getenv("BO3_DBG_ZERO_DRAWS") != nullptr;   // (diagnostics: the per-draw fixed cost)
+        vkCmdDrawIndexed(cmd, zeroDraws ? 0 : count, 1, uint32_t(hostFirstIndex), int32_t(GpuReg(XE_GPU_REG_VGT_INDX_OFFSET)), 0);
     }
     else
     {
         // no geometry shaders: 6 host vertices per rectangle (3 guest) / quad (4 guest)
         uint32_t hostCount = !gs || g_vk.hasGs ? count : gs == 1 ? count / 3 * 6 : count / 4 * 6;
-        vkCmdDraw(cmd, hostCount, 1, 0, indexed ? (indexBase & 0x1FFFFFFF) : 0);
+        static const bool zeroDraws = getenv("BO3_DBG_ZERO_DRAWS") != nullptr;   // (diagnostics: the per-draw fixed cost)
+        vkCmdDraw(cmd, zeroDraws ? 0 : hostCount, 1, 0, indexed ? (indexBase & 0x1FFFFFFF) : 0);
     }
     if (TimingMode() == 3)
     {
@@ -2455,7 +2567,7 @@ void RendererDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, bo
     if (vs->t.memexports)
     {
         // later draws/fetches may read what this one exported
-        EndPass();
+        EndPass(6);
         MemoryBarrierAll(cmd);
         r.memexportDraws++;
         r.guestWritesRecorded = true;
@@ -2617,6 +2729,7 @@ static void AfterPresent()
         r.resolved.clear();
         r.resolvedDepth.clear();
         r.inPass = false;
+        r.passPending = false;
         if (scaleChange)
         {
             float ps = float(ps6) / 60.0f;
@@ -2734,6 +2847,15 @@ static void AfterPresent()
             r.rts.size(), r.resolved.size());
         Log("renderer: %.1f passes/frame, %.2f MB/frame texture uploads, %llu memexport draws, %llu guest-write flushes", r.passCount / 120.0, TextureCacheUploadedBytes() / 120.0 / 1048576.0, (unsigned long long)r.memexportDraws, (unsigned long long)r.guestWriteFlushes);
         r.passCount = 0;
+        if (getenv("BO3_PASS_STATS"))
+        {
+            std::string st;
+            for (int k = 0; k < 10; k++) if (s_passEnd[k]) { char b[64]; snprintf(b, sizeof(b), " %s %.1f (%.2f Ms)", kPassEndWhy[k], s_passEnd[k] / 120.0, s_passEndMpx[k] / 120.0); st += b; }
+            Log("renderer: passes ended per frame by:%s; clears: %.1f rect draws, %.1f fast, %.1f with the pass not begun, %.1f folded into load ops", st.c_str(), s_clearCand / 120.0, s_clearFast / 120.0, s_clearPending / 120.0, s_clearFolded / 120.0);
+        }
+        memset(s_passEnd, 0, sizeof(s_passEnd));
+        memset(s_passEndMpx, 0, sizeof(s_passEndMpx));
+        s_clearFolded = s_clearFast = s_clearPending = s_clearCand = 0;
         Log("renderer: skipped draws: mode %llu, empty %llu, prim %llu, shader %llu, pitch %llu, no-target %llu, pipeline %llu, textures %llu, uniforms %llu, scissor %llu",
             (unsigned long long)r.skip[0], (unsigned long long)r.skip[1], (unsigned long long)r.skip[2], (unsigned long long)r.skip[3],
             (unsigned long long)r.skip[4], (unsigned long long)r.skip[5], (unsigned long long)r.skip[6], (unsigned long long)r.skip[7],
@@ -2746,7 +2868,7 @@ void RendererSwap(uint32_t frontBufferPhys, uint32_t width, uint32_t height)
 {
     if (!r.ready) return;
     BeginFrame();
-    EndPass();
+    EndPass(9);
     Frame& f = Cur();
 
     // 1) Submit the frame's rendering right away: it must not wait for the swapchain.
@@ -2896,7 +3018,13 @@ void RendererSwap(uint32_t frontBufferPhys, uint32_t width, uint32_t height)
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &r.presentReady[imageIndex];
     if (res) res->img.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    static const bool syncPresent = getenv("BO3_SYNC_PRESENT") != nullptr;   // the previous way (diagnostics)
+    // Android: off unless BO3_ASYNC_PRESENT=1 - no gain there (the GPU is the limit) and a phone run lost
+    // the device in this submit once (cause not found); desktops: on (BO3_SYNC_PRESENT=1 turns it off)
+#ifdef __ANDROID__
+    static const bool syncPresent = getenv("BO3_ASYNC_PRESENT") == nullptr;
+#else
+    static const bool syncPresent = getenv("BO3_SYNC_PRESENT") != nullptr;
+#endif
     if (!r.pendingShot && !syncPresent)
     {
         // The submit thread submits and presents, after the frame's other work (its queue is in
@@ -3020,7 +3148,7 @@ void RendererFlushGuestWrites()
     Frame& f = Cur();
     if (r.guestWritesRecorded && f.recording)
     {
-        EndPass();
+        EndPass(7);
         VK_CHECK(vkEndCommandBuffer(f.cmd));
         f.recording = false;
         f.timingPending = false;
@@ -3238,7 +3366,7 @@ void SubmitRecorded()
         // Submit the recorded part and keep recording this frame in a fresh command buffer
         // of the same pool: no wait, and the frame's uniform ring / descriptor pool / staging
         // stay valid (they are recycled when the frame slot's fence - the present - signals).
-        EndPass();
+        EndPass(8);
         BusyMark(f, true);
         VK_CHECK(vkEndCommandBuffer(f.cmd));
         VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };

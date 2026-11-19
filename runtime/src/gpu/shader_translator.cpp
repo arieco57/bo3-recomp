@@ -36,6 +36,9 @@ std::string Fmt(const char* fmt, ...)
     return buf;
 }
 
+static uint32_t s_texSlots = 32;   // (ShaderTranslatorSetTexSlots)
+static bool s_vsStores = true, s_psStores = true;   // vertex / fragment shaders may write storage buffers (memexport)
+
 struct Translator
 {
     bool ps;
@@ -472,7 +475,7 @@ struct Translator
                 if (off[i] == 0) return comp(i);
                 return denorm ? Fmt("(%s + %.6g)", comp(i).c_str(), off[i]) : Fmt("(%s + %.6g / %s)", comp(i).c_str(), off[i], size);
             };
-            std::string ts = Fmt("tsize(%u)", t), ts3 = Fmt("vec3(textureSize(tex3D[%u], 0))", t);
+            std::string ts = Fmt("tsize(%u)", t), ts3 = Fmt("vec3(textureSize(tex3D[%u], 0))", t % s_texSlots);
             switch (dim)
             {
             case xenos::FetchOpDimension::k1D:
@@ -947,6 +950,8 @@ vec4 tfetchCube(uint t, vec3 coord, float lod, float bias) {
 }
 
 static int s_vkMinor = 3;
+void ShaderTranslatorSetTexSlots(uint32_t n) { s_texSlots = std::clamp<uint32_t>(n, 1, 32); }
+void ShaderTranslatorSetStores(bool vertex, bool fragment) { s_vsStores = vertex; s_psStores = fragment; }
 static bool s_floatControls = true;
 void ShaderTranslatorSetDevice(int vulkanMinor, bool floatControls) { s_vkMinor = vulkanMinor; s_floatControls = floatControls; }
 
@@ -961,7 +966,12 @@ TranslatedShader TranslateShader(bool pixel, const uint32_t* code, uint32_t dwor
     };
     replaceAll("BINDING_STATE", pixel ? "2" : "1");
     replaceAll("PUSH_OFFSET", pixel ? "64" : "0");
-    replaceAll("MEM_QUALIFIER", t.result.memexports ? "" : "readonly");
+    // GPUs without storage writes in this stage (vertexPipelineStoresAndAtomics / fragmentStoresAndAtomics:
+    // some Mali / PowerVR drivers): exports are dropped - the shader still builds, its memory writes are lost
+    const bool canStore = pixel ? s_psStores : s_vsStores;
+    if (t.result.memexports && !canStore)
+        replaceAll("for (uint i = 0u; i < n; i++) mem[(addr + i) & 0x7FFFFFFu] = mxSwap(w[i], endian);", "if (n == 0u) return;");
+    replaceAll("MEM_QUALIFIER", t.result.memexports && canStore ? "" : "readonly");
     if (t.result.memexports) head.insert(head.find('\n') + 1, "#define MEMEXPORT 1\n");
     if (ShaderTranslatorLite()) head.insert(head.find('\n') + 1, "#define XLITE 1\n");
     if (!s_floatControls) head.insert(head.find('\n') + 1, "#define NO_FLOAT_CONTROLS 1\n");
@@ -972,6 +982,15 @@ TranslatedShader TranslateShader(bool pixel, const uint32_t* code, uint32_t dwor
     replaceAll("TEX2D_IMPLICIT", pixel ? "texture(tex2D[t], uv, bias)" : "textureLod(tex2D[t], uv, bias)");
     replaceAll("TEX3D_IMPLICIT", pixel ? "texture(tex3D[t], uvw, bias)" : "textureLod(tex3D[t], uvw, bias)");
     replaceAll("TEXCUBE_IMPLICIT", pixel ? "texture(texCube[t], d, bias)" : "textureLod(texCube[t], d, bias)");
+    if (s_texSlots < 32)
+    {
+        const std::string n = std::to_string(s_texSlots);
+        for (const char* a : { "tex2D", "tex3D", "texCube" })
+        {
+            replaceAll(std::string(a) + "[32];", std::string(a) + "[" + n + "];");
+            replaceAll(std::string(a) + "[t]", std::string(a) + "[t % " + n + "u]");
+        }
+    }
 
     std::string io;
     std::string mainFn;

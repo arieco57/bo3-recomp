@@ -772,6 +772,7 @@ void ParseBuffer(uint32_t addr, uint32_t dwords, int depth)
 void RecorderThread()
 {
     pthread_setname_np(pthread_self(), "gpu-cp");
+    ThreadPlace("gpu-cp");
     ProfilerAttachThisThread();
     if (!getenv("BO3_NO_WINDOW")) RendererInit();
     auto W = [](uint64_t i) { return q.buf[i & kQMask]; };
@@ -886,6 +887,7 @@ void CommandProcessorThread()
     if (s_split)
     {
         pthread_setname_np(pthread_self(), "gpu-pm4");
+        ThreadPlace("gpu-pm4");
         q.buf = new uint32_t[kQWords];
         std::thread(RecorderThread).detach();
         Log("gpu: command processor split into parser + recording threads");
@@ -893,6 +895,7 @@ void CommandProcessorThread()
     else
     {
         pthread_setname_np(pthread_self(), "gpu-cp");
+        ThreadPlace("gpu-cp");
         ProfilerAttachThisThread();
         if (!getenv("BO3_NO_WINDOW")) RendererInit();
     }

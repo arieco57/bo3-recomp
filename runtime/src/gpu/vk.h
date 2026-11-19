@@ -55,6 +55,12 @@ struct VkCtx
     bool hasEds = true;            // VK_EXT_extended_dynamic_state
     bool hasFloatControls = true;  // SignedZeroInfNanPreserve (fp32): the Xenos math emulation's inf / nan tests
     float maxAnisotropy = 1.0f;
+    // texture slots per kind (2D / 3D / cube) in the shaders' descriptor arrays: 32 (a fetch constant each),
+    // fewer on GPUs whose descriptor limits are lower (fetch constant t then uses slot t % texSlots)
+    uint32_t texSlots = 32;
+    uint32_t storeFlags = 0;      // 1: no storage writes in vertex shaders, 2: none in fragment shaders
+    // EDRAM depth surfaces: D24S8 where it can be rendered to and sampled, else D32S8 (Samsung Xclipse...)
+    VkFormat depthFormat = VK_FORMAT_D24_UNORM_S8_UINT;
     VkPipelineCache pipelineCache = VK_NULL_HANDLE;   // persisted in shadercache/pipelines.bin
 };
 
