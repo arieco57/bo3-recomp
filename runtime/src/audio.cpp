@@ -119,6 +119,7 @@ void AudioThread(GuestThread& t)
                 if (s_framesSubmitted == before) break;   // nothing mixed: don't spin
                 // frames back to back (refilling the queue): the decoder fills the voices' output
                 // rings between two, as on the console - otherwise streamed voices ran dry
+                XmaPollFull();
                 XmaWaitIdle(4000);
             }
         }
@@ -127,6 +128,7 @@ void AudioThread(GuestThread& t)
             next += std::chrono::microseconds(5333);
             std::this_thread::sleep_until(next);
             CallClients(t);
+            XmaPollFull();
             ticks++;
         }
         // every ~5 s (940 frames); the averages cover the frames since the last line
@@ -151,6 +153,9 @@ void AudioThread(GuestThread& t)
 float ToFloat(uint32_t bits) { float f; memcpy(&f, &bits, 4); return f; }
 uint32_t FromFloat(float f) { uint32_t b; memcpy(&b, &f, 4); return b; }
 }
+
+// frames of 256 samples (48 kHz) the game has mixed so far (xma.cpp: has it read a voice's ring?)
+uint64_t AudioFramesMixed() { return s_framesSubmitted.load(std::memory_order_relaxed); }
 
 // XAudioRegisterRenderDriverClient(callback_info* {callback, arg}, driver*)
 GUEST_IMPORT(XAudioRegisterRenderDriverClient)

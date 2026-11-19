@@ -19,6 +19,7 @@
 #include "memory.h"
 #include "stubs.h"
 #include "xma.h"
+#include "thread.h"
 #include "write_watch.h"
 #include "arch.h"
 
@@ -42,6 +43,8 @@ extern "C" {
 #include <mutex>
 #include <thread>
 #include <vector>
+
+uint64_t AudioFramesMixed();   // audio.cpp
 
 namespace
 {
@@ -75,6 +78,7 @@ struct Context
     bool full = false;          // output ring filled (write == read) and not read since
     uint32_t fullRead = 0;
     std::chrono::steady_clock::time_point fullTime;   // (a whole ring read between two passes: given up after 100 ms)
+    uint64_t fullFrames = 0;    // AudioFramesMixed() when it filled
     std::vector<uint8_t> pcm;   // decoded, not yet written (s16 BE, interleaved)
 
     void Lock() { while (busy.test_and_set(std::memory_order_acquire)) { } }
@@ -89,6 +93,7 @@ sem_t s_work;
 std::atomic<uint64_t> s_kickSeq{ 0 }, s_doneSeq{ 0 };
 std::mutex s_allocLock;
 bool s_log = false;
+bool s_logStarts = false;   // BO3_XMA_STARTS: only sounds starting and contexts created / released
 AVPacket* s_packet = nullptr;
 AVFrame* s_frame = nullptr;
 
@@ -293,7 +298,7 @@ void Drain(Context& c)
     c.fedSinceDrain = false;
 }
 
-extern std::atomic<uint64_t> s_statStarved;
+extern std::atomic<uint64_t> s_statStarved, s_statFullEnd[5], s_statFullHeld;
 void Work(uint32_t id)
 {
     Context& c = s_ctx[id];
@@ -303,7 +308,7 @@ void Work(uint32_t id)
         c.Unlock();
         return;
     }
-    if (c.needsReset && s_log)
+    if (c.needsReset && (s_log || s_logStarts))
     {
         uint32_t r[10];
         for (int k = 0; k < 10; k++) r[k] = ReadDword(id, k);
@@ -343,15 +348,27 @@ void Work(uint32_t id)
     // filled: until the game reads (its read offset moves) nothing is written, even if it marks the
     // output valid and kicks again right away - otherwise the blocks it has not read yet were
     // overwritten (the first 24 ms of every short sound lost: gunshots barely audible).
-    // Read position back where it was can also mean the game read the whole ring (a burst of mixing
-    // frames on a phone): once the ring's length of time has passed, it counts as read. (A fixed
-    // 100 ms here played streamed voices as 24 ms pieces every 100 ms - choppy announcer.)
+    // write == read again can also mean the game read the whole ring: on a phone the mixer runs
+    // frames back to back and reads a ring between two passes (streamed voices played as 24 ms pieces
+    // every 100 ms). It counts as read once the game has mixed the ring's length of audio since it
+    // filled; not before (a shorter fixed time cut gunshots: the game marks the output valid and
+    // kicks again before it has mixed anything); 100 ms at most. BO3_XMA_FULL_MS: tests.
+    static const int fullMs = getenv("BO3_XMA_FULL_MS") ? atoi(getenv("BO3_XMA_FULL_MS")) : 100;
     if (c.full)
     {
         const double ringSec = double(capacity) * kBlockBytes / (double(std::max(c.avRate, 8000)) * std::max(c.avChannels, 1) * 2);
-        if (readBlock != c.fullRead || writeBlock != readBlock ||
-            std::chrono::steady_clock::now() - c.fullTime > std::chrono::duration<double>(ringSec * 0.9))
-            c.full = false;
+        const double mixedSec = double(AudioFramesMixed() - c.fullFrames) * 256.0 / 48000.0;
+        // Marked valid again once a frame has been mixed since the ring filled: read. (Dialogue, announcer:
+        // the game copies the whole ring out without moving the read offset and asks for more a frame
+        // later; holding them until a ring's length was mixed left them short every cycle - gaps. Not at
+        // once: a gunshot's ring is marked valid again before anything was mixed.)
+        static const bool noCopyRule = getenv("BO3_XMA_NO_COPY_RULE") != nullptr;   // (A/B)
+        const uint64_t mixedFrames = AudioFramesMixed() - c.fullFrames;
+        int why = readBlock != c.fullRead || writeBlock != readBlock ? 0 : !noCopyRule && mixedFrames >= 1 ? 4 :
+                  mixedSec >= ringSec * 0.95 ? 1 : std::chrono::steady_clock::now() - c.fullTime > std::chrono::milliseconds(fullMs) ? 2 : -1;
+        if (why >= 0) { c.full = false; s_statFullEnd[why]++; }
+        if (why >= 1 && getenv("BO3_XMA_STATS")) { static int n = 0; if (n++ % 50 == 0) Log("xma: ctx %u released by %s: cap %u, read %u write %u, +%llu frames, ring %.1f ms", id, why == 1 ? "mixed" : "timeout", capacity, readBlock, writeBlock, (unsigned long long)(AudioFramesMixed() - c.fullFrames), ringSec * 1000); }
+        else s_statFullHeld++;
     }
     uint32_t freeBlocks = c.full ? 0 : readBlock > writeBlock ? readBlock - writeBlock : capacity - writeBlock + readBlock;
     if (freeBlocks == capacity && (valid[0] || valid[1]) && c.fedSinceDrain) s_statStarved++;   // the game read everything: late
@@ -403,10 +420,14 @@ void Work(uint32_t id)
             }
             readOffset = next * kPacketBits + 32;
         }
-        if (c.pcm.size() < kBlockBytes && !valid[0] && !valid[1] && c.fedSinceDrain)
+        if (c.pcm.size() < kBlockBytes && !valid[0] && !valid[1])
         {
-            Drain(c);   // end of the sound: get the decoder's buffered tail
-            if (!c.pcm.empty() && c.pcm.size() < kBlockBytes) c.pcm.resize(kBlockBytes, 0);
+            if (c.fedSinceDrain) Drain(c);   // end of the sound: get the decoder's buffered tail
+            // the last partial block, padded with silence - also when the tail was longer than a block and its
+            // remainder comes out passes later (left unwritten, the game kept waiting for the sound's last
+            // samples: the voice never ended and, past its instance limit, the sound stopped playing -
+            // Freerun's thrust after four boosts)
+            if (c.pcm.size() % kBlockBytes) c.pcm.resize((c.pcm.size() / kBlockBytes + 1) * kBlockBytes, 0);
         }
         if (c.pcm.size() < kBlockBytes) break;
         memcpy(Phys(outPtr + writeBlock * kBlockBytes), c.pcm.data(), kBlockBytes);
@@ -433,6 +454,7 @@ void Work(uint32_t id)
         c.full = !oldRing;
         c.fullRead = readBlock;
         c.fullTime = std::chrono::steady_clock::now();
+        c.fullFrames = AudioFramesMixed();
     }
     d2 = (d2 & ~0x3FFFFFFu) | (readOffset & 0x3FFFFFF);
     if (curChanged) d4 = (d4 & ~(1u << 31)) | (cur << 31);
@@ -450,7 +472,7 @@ void Work(uint32_t id)
 }
 
 // BO3_XMA_STATS=1: decoder load every 2 s (busy time, rings found empty = voices that ran dry)
-std::atomic<uint64_t> s_statStarved{ 0 };
+std::atomic<uint64_t> s_statStarved{ 0 }, s_statFullEnd[5] = {}, s_statFullHeld{ 0 };
 void Stats(double workMs)
 {
     static const bool on = getenv("BO3_XMA_STATS") != nullptr;
@@ -463,14 +485,28 @@ void Stats(double workMs)
     auto now = std::chrono::steady_clock::now();
     double el = std::chrono::duration<double>(now - last).count();
     if (el < 2.0) return;
-    Log("xma stats: %llu passes, busy %.0f%%, worst %.1f ms, %llu rings found empty", (unsigned long long)works, busy / (el * 10.0), worst,
-        (unsigned long long)s_statStarved.exchange(0));
+    Log("xma stats: %llu passes, busy %.0f%%, worst %.1f ms, %llu rings found empty; full rings released: %llu read, %llu mixed, %llu timeout, %llu polled, %llu copied; %llu kicks held",
+        (unsigned long long)works, busy / (el * 10.0), worst, (unsigned long long)s_statStarved.exchange(0),
+        (unsigned long long)s_statFullEnd[0].exchange(0), (unsigned long long)s_statFullEnd[1].exchange(0), (unsigned long long)s_statFullEnd[2].exchange(0), (unsigned long long)s_statFullEnd[3].exchange(0), (unsigned long long)s_statFullEnd[4].exchange(0),
+        (unsigned long long)s_statFullHeld.exchange(0));
     last = now; busy = worst = 0; works = 0;
+    if (getenv("BO3_XMA_DUMPCTX"))   // (diagnostics) every live stereo context
+        for (uint32_t id = 0; id < kContextCount; id++)
+        {
+            Context& c = s_ctx[id];
+            if (!c.allocated) continue;
+            uint32_t d0 = ReadDword(id, 0), d1 = ReadDword(id, 1), d2 = ReadDword(id, 2), d4 = ReadDword(id, 4), d9 = ReadDword(id, 9);
+            if (!Bits(d1, 29, 1)) continue;
+            Log("xma ctx %u: in valid %u%u cur %u read %u, out valid %u write %u read %u cap %u, loops %u, full %d fed %d kicked %d pcm %zu",
+                id, Bits(d0, 20, 1), Bits(d0, 21, 1), Bits(d4, 31, 1), Bits(d2, 0, 26), Bits(d1, 31, 1), Bits(d0, 27, 5), Bits(d9, 0, 5),
+                Bits(d0, 22, 5), Bits(d0, 12, 8), int(c.full), int(c.fedSinceDrain), int(c.kicked.load()), c.pcm.size());
+        }
 }
 
 void Worker()
 {
     pthread_setname_np(pthread_self(), "xma-decoder");
+    ThreadPlace("xma-decoder");
 #ifdef __ANDROID__
     // like the mixing thread (audio.cpp): late decoding leaves the game's voices without samples
     // (sounds cut short) - on a phone the game's threads would otherwise keep this one waiting
@@ -567,6 +603,7 @@ bool DecodeStore(const uint8_t* ip, const ucontext_t* uc, uint32_t& value, int& 
 void XmaInit()
 {
     s_log = getenv("BO3_XMA_LOG") != nullptr;
+    s_logStarts = getenv("BO3_XMA_STARTS") != nullptr;
     av_log_set_level(AV_LOG_QUIET);
     s_packet = av_packet_alloc();
     s_frame = av_frame_alloc();
@@ -626,9 +663,11 @@ GUEST_IMPORT(XMACreateContext)
             c.needsReset = true;
             c.Unlock();
             GuestWrite32(ARG(3), 0xA0000000u | (s_arrayPhys + i * kContextSize));
+            if (s_logStarts) { uint32_t n = 0; for (auto& x : s_ctx) n += x.allocated; Log("xma: ctx %u created (%u in use)", i, n); }
             RETURN(0);
         }
     GuestWrite32(ARG(3), 0);
+    LogWarn("xma: no free context (all %u in use)", kContextCount);
     RETURN(0x80004005u);
 }
 
@@ -644,8 +683,37 @@ GUEST_IMPORT(XMAReleaseContext)
         c.needsReset = true;
         memset(ContextData((phys - s_arrayPhys) / kContextSize), 0, kContextSize);
         c.Unlock();
+        if (s_logStarts) Log("xma: ctx %u released", (phys - s_arrayPhys) / kContextSize);
     }
     RETURN(0);
+}
+
+// After every mixing frame (audio driver): a full ring whose read offset has moved is being read - it is
+// released and decoded into right away. (The game reads a ring a frame's worth at a time; seen only at
+// its next kick, the offset could be back where it was - the whole ring read, write == read again - and
+// the ring stayed held until the voice had run dry: dialogue with gaps.)
+void XmaPollFull()
+{
+    bool any = false;
+    for (uint32_t id = 0; id < kContextCount; id++)
+    {
+        Context& c = s_ctx[id];
+        if (!c.full || !c.allocated.load(std::memory_order_relaxed)) continue;
+        if (c.busy.test_and_set(std::memory_order_acquire)) continue;   // (the decoder has it: its own pass decides)
+        if (c.full && Bits(ReadDword(id, 9), 0, 5) != c.fullRead)
+        {
+            c.full = false;
+            s_statFullEnd[3]++;
+            c.kicked.store(true, std::memory_order_release);
+            any = true;
+        }
+        c.Unlock();
+    }
+    if (any)
+    {
+        s_kickSeq.fetch_add(1, std::memory_order_release);
+        sem_post(&s_work);
+    }
 }
 
 // Waits (up to maxUs) until the decoder has handled every kick so far: the audio driver calls this
