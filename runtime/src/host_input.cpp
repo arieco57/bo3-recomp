@@ -33,7 +33,7 @@
 namespace
 {
 SDL_Gamepad* s_pad = nullptr;
-struct AutoPress { double t; uint32_t buttons; bool done; };
+struct AutoPress { double t; uint32_t buttons; bool done; double hold = 0.25; };
 std::vector<AutoPress> s_auto;
 auto s_start = std::chrono::steady_clock::now();
 
@@ -802,14 +802,17 @@ void HostInputUpdate()
             double at = t + 0.1;
             for (char* tok = strtok(buf, ", \r\n"); tok; tok = strtok(nullptr, ", \r\n"))
             {
+                // "A~1.5": held for 1.5 s (tests: jump + thrust)
+                double hold = 0.25;
+                if (char* tl = strchr(tok, '~')) { *tl = 0; hold = std::clamp(atof(tl + 1), 0.05, 10.0); }
                 uint32_t b = ButtonByName(tok);
-                s_auto.push_back({ at, b, false });
-                at += b > 0xFFFF ? 0.25 : 0.6;   // sticks / triggers back to back (held), buttons apart (taps)
+                s_auto.push_back({ at, b, false, hold });
+                at += hold > 0.25 ? hold + 0.35 : b > 0xFFFF ? 0.25 : 0.6;   // sticks / triggers back to back (held), buttons apart (taps)
             }
         }
     }
     for (auto& ap : s_auto)
-        if (t >= ap.t && t < ap.t + 0.25)
+        if (t >= ap.t && t < ap.t + ap.hold)
         {
             st.buttons |= uint16_t(ap.buttons & 0xFFFF);
             if (ap.buttons & kPseudoRT) st.rightTrigger = 255;
@@ -823,7 +826,7 @@ void HostInputUpdate()
             if (ap.buttons & kRsUp) st.ry = 20000;
             if (ap.buttons & kRsDown) st.ry = -20000;
         }
-        else if (t >= ap.t + 0.25 && !ap.done) { ap.done = true; Log("input: autopress %.1fs done", ap.t); }
+        else if (t >= ap.t + ap.hold && !ap.done) { ap.done = true; Log("input: autopress %.1fs done", ap.t); }
     RecordOrReplay(t, st);
     InputSetPad(st);
 }

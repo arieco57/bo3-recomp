@@ -19,8 +19,19 @@ for l in lines[pos + 1:]:
     if len(p) >= 6 and 'x' in p[1]:
         a, b = (int(x, 16) for x in p[0].split('-'))
         maps.append((a, b, int(p[2], 16), p[5].strip()))
+# libraries of another machine (an Android phone): looked up by name in BO3_LIBDIRS (":"-separated)
+# and next to the executable given
+import os
+libdirs = [d for d in os.environ.get('BO3_LIBDIRS', '').split(':') if d] + [os.path.dirname(os.path.abspath(exe))]
+def local(path):
+    if os.path.exists(path): return path
+    for d in libdirs:
+        q = os.path.join(d, os.path.basename(path))
+        if os.path.exists(q): return q
+    return path
 symcache = {}
 def syms(path):
+    path = local(path)
     if path in symcache: return symcache[path]
     out = subprocess.run(['nm', '-C', '--defined-only', '-n', path], capture_output=True, text=True).stdout
     if not out.strip():
@@ -35,6 +46,7 @@ def syms(path):
 loads = {}
 def to_vaddr(path, fileoff):
     # file offset -> link-time address (Android libraries: segments are not at vaddr == offset)
+    path = local(path)
     if path not in loads:
         segs = []
         out = subprocess.run(['readelf', '-lW', path], capture_output=True, text=True).stdout
