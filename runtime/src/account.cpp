@@ -5,6 +5,7 @@
 #include "ui.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <mutex>
@@ -159,25 +160,55 @@ bool SignIn()
     }
 }
 
-// Recovery by code: Supabase mails a code (the "Reset Password" template must contain {{ .Token }}),
-// which signs the user in so the new password can be set here.
+// The link of Supabase's default "Reset Password" email, copied (not opened: opening it uses it up):
+// .../auth/v1/verify?token=<hash>&type=recovery&redirect_to=... -> the hash ("" = not a link).
+std::string RecoveryLinkToken(const std::string& text)
+{
+    size_t p = text.find("token=");
+    while (p != std::string::npos && p > 0 && text[p - 1] != '?' && text[p - 1] != '&') p = text.find("token=", p + 1);
+    if (p == std::string::npos) return "";
+    std::string out;
+    for (size_t i = p + 6; i < text.size() && text[i] != '&' && text[i] != '#' && !isspace((unsigned char)text[i]); i++)
+    {
+        if (text[i] == '%' && i + 2 < text.size() && isxdigit((unsigned char)text[i + 1]) && isxdigit((unsigned char)text[i + 2]))
+        {
+            out += char(std::stoi(text.substr(i + 1, 2), nullptr, 16));
+            i += 2;
+        }
+        else out += text[i];
+    }
+    return out;
+}
+
+// Recovery: Supabase mails a code (a "Reset Password" template with {{ .Token }}, editable with a custom
+// SMTP) or, with the default template, a link that the player copies here. Either signs the user in so
+// the new password can be set here.
 bool Recover()
 {
     std::vector<UiField> f = { { "Email de la cuenta" } };
-    if (!UiForm("Recuperar contraseña", "Te vamos a mandar un código por email.", f)) return false;
+    if (!UiForm("Recuperar contraseña", "Te vamos a mandar un código o un link por email.", f)) return false;
     std::string email = Trim(f[0].value);
     HttpResponse r = HttpRequest("POST", s_url + "/auth/v1/recover", H(), "{\"email\":\"" + JsonEscape(email) + "\"}");
     if (r.status != 200) { UiMessage("Recuperar contraseña", "No se pudo enviar el email: " + ErrorText(r)); return false; }
     std::string err;
     for (;;)
     {
-        std::vector<UiField> g = { { "Código del email" }, { "Contraseña nueva (mínimo 6)", true }, { "Repetir contraseña", true } };
-        if (!UiForm("Recuperar contraseña", (err.empty() ? std::string() : err + "\n\n") + "Revisá tu email (también la carpeta de spam).", g)) return false;
+        std::vector<UiField> g = { { "Código o link del email" }, { "Contraseña nueva (mínimo 6)", true }, { "Repetir contraseña", true } };
+        if (!UiForm("Recuperar contraseña", (err.empty() ? std::string() : err + "\n\n") +
+                    "Revisá tu email (también la carpeta de spam). Si te llegó un link, no lo abras: copialo "
+                    "(mantené apretado o clic derecho > Copiar enlace) y pegalo acá.", g)) return false;
         if (g[1].value.size() < 6) { err = "La contraseña tiene que tener al menos 6 caracteres."; continue; }
         if (g[1].value != g[2].value) { err = "Las contraseñas no coinciden."; continue; }
-        HttpResponse v = HttpRequest("POST", s_url + "/auth/v1/verify", H(),
-                                     "{\"type\":\"recovery\",\"email\":\"" + JsonEscape(email) + "\",\"token\":\"" + JsonEscape(Trim(g[0].value)) + "\"}");
-        if (!TakeSession(v)) { err = "Código incorrecto o vencido."; continue; }
+        const std::string link = RecoveryLinkToken(g[0].value);
+        HttpResponse v = HttpRequest("POST", s_url + "/auth/v1/verify", H(), link.empty()
+            ? "{\"type\":\"recovery\",\"email\":\"" + JsonEscape(email) + "\",\"token\":\"" + JsonEscape(Trim(g[0].value)) + "\"}"
+            : "{\"type\":\"recovery\",\"token_hash\":\"" + JsonEscape(link) + "\"}");
+        if (!TakeSession(v))
+        {
+            LogWarn("account: recovery verify failed (%d, %s) %s", v.status, link.empty() ? "code" : "link", ErrorText(v).c_str());
+            err = link.empty() ? "Código incorrecto o vencido." : "El link ya se usó o venció (abrirlo lo gasta). Pedí otro email y copiá el link sin abrirlo.";
+            continue;
+        }
         HttpResponse u = HttpRequest("PUT", s_url + "/auth/v1/user", H(s_token), "{\"password\":\"" + JsonEscape(g[1].value) + "\"}");
         if (u.status != 200) { err = ErrorText(u); continue; }
         HttpResponse pr = HttpRequest("GET", s_url + "/rest/v1/profiles?select=username", H(s_token), "");
