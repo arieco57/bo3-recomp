@@ -197,9 +197,9 @@ int main(int argc, char** argv)
     Log("BO3 Recomp runtime (%s)", BO3_EXE_KIND);
     const bool windowed = !getenv("BO3_NO_WINDOW");
 #ifndef __ANDROID__
-    // first run (Linux): the installer window, where the player picks the files of their copy
-    // (not when everything missing is already in "instalar/": that installs by itself below)
-    if (windowed && !SetupInstalled() && !(getenv("BO3_SETUP_YES") && *getenv("BO3_SETUP_YES") == '1') && !SetupLocalComplete())
+    // first run (Linux): the installer window, where the player picks the files of their copy (as
+    // on Android: always shown; only BO3_SETUP_YES=1 installs from "instalar/" without it)
+    if (windowed && !SetupInstalled() && !(getenv("BO3_SETUP_YES") && *getenv("BO3_SETUP_YES") == '1'))
         if (InstallerUiRun(BO3_EXE_KIND[0] == 'z') == 0) return 0;
 #endif
     if (windowed)

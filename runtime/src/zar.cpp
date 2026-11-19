@@ -18,24 +18,29 @@
 #include <vector>
 
 #include <zstd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 namespace
 {
-int ProcFdWithoutProc(const char* p)   // N for "/proc/self/fd/N" when that path cannot be opened, else -1
+// N for a "/proc/self/fd/N" path whose descriptor is open, else -1. Android's file picker hands
+// those out; opening the path itself re-opens the real file (/storage/emulated/0/Download/...),
+// which MediaProvider denies without "all files access" - the descriptor itself still reads.
+int ProcFd(const char* p)
 {
     int n;
     char extra;
     if (sscanf(p, "/proc/self/fd/%d%c", &n, &extra) != 1 || n < 0) return -1;
-    return access(p, F_OK) == 0 ? -1 : n;
+    return fcntl(n, F_GETFD) == -1 ? -1 : n;
 }
 }
 
 FILE* FopenInput(const char* path, const char* mode)
 {
-    int n = mode[0] == 'r' && !strchr(mode, '+') ? ProcFdWithoutProc(path) : -1;
-    if (n < 0) return fopen(path, mode);
+    if (FILE* f = fopen(path, mode)) return f;
+    int n = mode[0] == 'r' && !strchr(mode, '+') ? ProcFd(path) : -1;
+    if (n < 0) return nullptr;
     int d = dup(n);
     if (d < 0) return nullptr;
     FILE* f = fdopen(d, "rb");
@@ -47,8 +52,11 @@ FILE* FopenInput(const char* path, const char* mode)
 bool InputStat(const std::string& path, uint64_t& size, bool& isDir)
 {
     struct stat st;
-    int n = ProcFdWithoutProc(path.c_str());
-    if (n >= 0 ? fstat(n, &st) != 0 : stat(path.c_str(), &st) != 0) return false;
+    if (stat(path.c_str(), &st) != 0)
+    {
+        int n = ProcFd(path.c_str());
+        if (n < 0 || fstat(n, &st) != 0) return false;
+    }
     size = uint64_t(st.st_size);
     isDir = S_ISDIR(st.st_mode);
     return true;

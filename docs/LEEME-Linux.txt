@@ -12,21 +12,20 @@ REQUISITOS
 - Unos 8 GB libres para la instalación.
 
 INSTALACIÓN (una sola vez)
-1. Poné en una misma carpeta (por ejemplo ~/Juegos/BO3Recomp):
+1. Poné los dos AppImage en una misma carpeta (por ejemplo ~/Juegos/BO3Recomp); el juego se
+   instala ahí, al lado de ellos:
    - BO3Recomp-mp-<versión>-x86_64.AppImage (Multijugador)
    - BO3Recomp-zm-<versión>-x86_64.AppImage (Zombies)
-   - una carpeta llamada "instalar"
-2. Copiá a la carpeta "instalar":
-   - La imagen del disco del juego (.iso, dump de tu disco).
-   - El Title Update del juego: el archivo de tu consola en
-     Content/0000000000000000/4156091D/000B0000/
-     (es obligatorio: el port corresponde al juego actualizado).
-   - Los Compatibility Pack 1 y 2 (DLC gratis de Xbox Live, obligatorios) y, si querés,
-     el resto de tus DLC: archivos de Content/0000000000000000/4156091D/00000002/
-3. Dale permiso de ejecución al AppImage (clic derecho > Propiedades > Permisos, o en la
-   terminal: chmod +x BO3Recomp-*.AppImage) y ábrelo con doble clic. La primera vez el
-   juego se instala solo desde esos archivos (tarda unos minutos) y verifica que sea la
-   versión correcta. Después podés borrar el .iso y los paquetes.
+2. Dale permiso de ejecución (clic derecho > Propiedades > Permisos, o en la terminal:
+   chmod +x BO3Recomp-*.AppImage) y abrí cualquiera de los dos con doble clic.
+3. Se abre la pantalla de instalación. Elegí cada cosa con sus botones ("Elegir", "Archivo" o "Carpeta"):
+   1. la imagen del disco (.iso o .zar, dump de tu disco),
+   2. el Title Update del juego (TU 8: el archivo de Content/0000000000000000/4156091D/000B0000/),
+   3. y 4. los Compatibility Pack 1 y 2 (DLC gratis de Xbox Live, obligatorios),
+   5. opcional: tus otros DLC (archivos de Content/0000000000000000/4156091D/00000002/).
+   Sirven los archivos de la consola, en .zip, o las carpetas extraídas por Xenia.
+4. Tocá "Convertir". Tarda unos minutos y verifica que sea la versión correcta. Después
+   podés borrar la imagen y los paquetes.
 
 JUGAR
 - Multijugador / Freerun: BO3Recomp-mp (doble clic).
@@ -39,6 +38,7 @@ JUGAR
   sudo apt install libfuse2t64; en Fedora: sudo dnf install fuse-libs).
 
 ENGLISH
-This package does not contain the game. Put the AppImage, a folder called "instalar" with your own
-Xbox 360 disc image (.iso), the Title Update, the Compatibility Packs 1 + 2 and any other DLC
-in one folder, and open the AppImage: the first run installs and verifies the game.
+This package does not contain the game. Put both AppImages in one folder and open one: the
+installer screen asks for your own Xbox 360 disc image (.iso/.zar), the Title Update (TU 8), the
+Compatibility Packs 1 + 2 and any other DLC (console files, .zip, or Xenia-extracted folders).
+"Convertir" installs and verifies the game next to the AppImages.

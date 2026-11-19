@@ -6,20 +6,23 @@ del juego, así se instala una sola vez).
 
 REQUISITOS
 - Android 10 o más nuevo, 64 bits, con Vulkan.
-- Probado en GPU Adreno (Qualcomm Snapdragon). Con Mali / PowerVR puede no funcionar.
+- Probado en GPU Adreno (Qualcomm Snapdragon). Mali, Xclipse (Samsung Exynos) y PowerVR
+  tienen soporte pero todavía no se probaron: si falla, mandá el log
+  (Descargas/BO3Recomp/bo3-mp-log.txt o bo3-zm-log.txt).
 - Unos 16 GB libres para instalar (8 GB del juego + la imagen que copies; la imagen se
   puede borrar después).
 
 INSTALACIÓN
 1. Instalá el APK (permití "instalar apps desconocidas").
-2. Copiá a la carpeta BO3Recomp de la memoria del teléfono (o a Descargas):
-   - la imagen del disco (.iso) de tu copia de Xbox 360,
-   - el Title Update del juego (archivo de Content/0000000000000000/4156091D/000B0000/),
-   - los Compatibility Pack 1 y 2 (DLC gratis, obligatorios) y tus otros DLC
+2. Copiá al teléfono (a cualquier carpeta, por ejemplo Descargas) los archivos de tu copia:
+   - la imagen del disco (.iso o .zar) de tu copia de Xbox 360,
+   - el Title Update del juego (TU 8: archivo de Content/0000000000000000/4156091D/000B0000/),
+   - los Compatibility Pack 1 y 2 (DLC gratis, obligatorios) y, si querés, tus otros DLC
      (archivos de Content/0000000000000000/4156091D/00000002/).
-3. Abrí la app. Te pide el permiso "Acceso a todos los archivos" (para leer esa
-   carpeta), y la primera vez instala el juego sola: puede tardar 15-20 minutos con la
-   pantalla quieta, no la cierres.
+   Sirven los archivos de la consola, en .zip, o las carpetas extraídas por Xenia.
+3. Abrí la app: se abre la pantalla de instalación. Elegí cada cosa con sus botones ("Elegir",
+   "Archivo" o "Carpeta") y tocá "Convertir". Puede tardar 15-20 minutos, no cierres la app.
+   Después podés borrar la imagen y los paquetes.
 
 JUGAR
 - Mando por Bluetooth/USB, o el mando en pantalla: OPCIONES > "Mando virtual".

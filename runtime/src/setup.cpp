@@ -441,8 +441,15 @@ Inputs FindInputs()
     for (auto& dir : InputDirs())
     {
         std::error_code ec;
+        // folders too in the player's input folders (Xenia's content/ tree: content/0000000000000000/
+        // 4156091D/00000002/<DLC> is 4 levels down), not in the data folder (its own installed
+        // content) nor in Download
+        const bool dirs = dir != "." && dir.find("Download") == std::string::npos;
         for (auto& e : fs::directory_iterator(dir, ec))
+        {
             if (e.is_regular_file(ec)) Classify(in, e.path().string());
+            else if (dirs && e.is_directory(ec) && e.path().filename() != "instalar-carpetas") ClassifyDir(in, e.path(), 4);
+        }
     }
     return in;
 }
