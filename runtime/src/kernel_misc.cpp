@@ -181,6 +181,7 @@ GUEST_IMPORT(RtlRaiseException)
         uint32_t tid = GuestRead32(rec + 0x14 + 8);
         std::string name = GuestString(namePtr);
         Log("thread name: 0x%X = \"%s\"", tid, name.c_str());
+        if (tid == 0xFFFFFFFFu) ThreadPlace(name.c_str());
         if (const char* want = getenv("BO3_PROFILE_THREAD"); want && tid == 0xFFFFFFFFu && name == want) ProfilerAttachThisThread(true);
         RETURN(0);
     }

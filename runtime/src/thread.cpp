@@ -182,6 +182,7 @@ std::shared_ptr<GuestThread> ThreadCreateHost(const char* name, std::function<vo
         ss.ss_size = altStack.size();
         sigaltstack(&ss, nullptr);
         pthread_setname_np(pthread_self(), n.substr(0, 15).c_str());
+        ThreadPlace(n.c_str());
         t->pthread = pthread_self();
         t->ctx->fpscr.loadFromHost();
         body(*t);
@@ -272,4 +273,79 @@ void ThreadSampleAll(const char* why)
         }
         Log("stall (%s): t%u rip 0x%llx%s guest %s", why, t->id, (unsigned long long)t->sampledRip.load(), extra.c_str(), t->ctx ? GuestBacktrace(*t->ctx, 10).c_str() : "-");
     }
+}
+
+#ifdef __linux__
+#include <sched.h>
+#endif
+void ThreadPlace(const char* name)
+{
+#ifdef __linux__
+    // Android default (measured on a 2 big + 6 little phone in Zombies: +5-7% fps): the game's main,
+    // render and GPU-recording threads on the fast cores, the rest away from them. BO3_BIG_THREADS=off
+    // turns it off.
+#ifdef __ANDROID__
+    static const char* kBig = "Main,2_Backend,gpu-cp";
+    static const char* kLittle = "JQ Worker,gpu-pm4,Stream,Database,Netchan,3_Server";
+#else
+    static const char* kBig = nullptr;
+    static const char* kLittle = nullptr;
+#endif
+    static const bool off = getenv("BO3_BIG_THREADS") && strcmp(getenv("BO3_BIG_THREADS"), "off") == 0;
+    static const char* big = off ? nullptr : getenv("BO3_BIG_THREADS") ? getenv("BO3_BIG_THREADS") : kBig;
+    static const char* little = off ? nullptr : getenv("BO3_LITTLE_THREADS") ? getenv("BO3_LITTLE_THREADS") : kLittle;
+    if ((!big && !little) || !name) return;
+    auto listed = [&](const char* list) {
+        if (!list) return false;
+        std::string l = list;
+        for (size_t p = 0; p <= l.size();)
+        {
+            size_t c = l.find(',', p);
+            std::string item = l.substr(p, c == std::string::npos ? std::string::npos : c - p);
+            if (!item.empty() && strncmp(name, item.c_str(), item.size()) == 0) return true;
+            if (c == std::string::npos) break;
+            p = c + 1;
+        }
+        return false;
+    };
+    bool toBig = listed(big), toLittle = !toBig && listed(little);
+    if (!toBig && !toLittle) return;
+    // big cores: those with the highest maximum frequency
+    static cpu_set_t bigSet, littleSet;
+    static bool init = [] {
+        CPU_ZERO(&bigSet); CPU_ZERO(&littleSet);
+        long top = 0, f[64] = {};
+        int n = 0;
+        for (; n < 64; n++)
+        {
+            char p[96];
+            snprintf(p, sizeof(p), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", n);
+            FILE* fp = fopen(p, "r");
+            if (!fp) break;
+            if (fscanf(fp, "%ld", &f[n]) != 1) f[n] = 0;
+            fclose(fp);
+            top = std::max(top, f[n]);
+        }
+        // fast cores: the top frequency tier, plus the next tiers until there are at least two (phones
+        // with one "prime" core); nothing at all when every core is the same
+        long cut = top;
+        auto count = [&](long c) { int k = 0; for (int i = 0; i < n; i++) k += f[i] >= c; return k; };
+        while (count(cut) < 2)
+        {
+            long next = 0;
+            for (int i = 0; i < n; i++) if (f[i] < cut) next = std::max(next, f[i]);
+            if (next == 0) break;
+            cut = next;
+        }
+        for (int i = 0; i < n; i++) CPU_SET(i, f[i] >= cut ? &bigSet : &littleSet);
+        if (CPU_COUNT(&littleSet) == 0) CPU_ZERO(&bigSet);
+        return true;
+    }();
+    (void)init;
+    cpu_set_t& set = toBig ? bigSet : littleSet;
+    if (CPU_COUNT(&set) == 0) return;
+    if (sched_setaffinity(0, sizeof(set), &set) == 0) Log("thread \"%s\" kept on the %s cores", name, toBig ? "big" : "little");
+#else
+    (void)name;
+#endif
 }

@@ -45,6 +45,9 @@ struct GuestThread : KObject
 
 // Diagnostics: log every guest thread's host instruction pointer and guest backtrace.
 void ThreadSampleAll(const char* why);
+// CPU placement by thread name (calling thread): BO3_BIG_THREADS / BO3_LITTLE_THREADS = comma-separated
+// name prefixes kept on the fastest / the other cores (phones: 2 big + 6 little cores)
+void ThreadPlace(const char* name);
 
 // Creates a thread. suspended = CREATE_SUSPENDED. Returns nullptr on failure.
 std::shared_ptr<GuestThread> ThreadCreate(uint32_t stackSize, uint32_t xapiStartup, uint32_t startAddress,
